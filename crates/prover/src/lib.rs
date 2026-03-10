@@ -1,5 +1,6 @@
 pub mod build;
 mod components;
+pub mod germ_bridge;
 pub mod recursion;
 pub mod shapes;
 mod types;

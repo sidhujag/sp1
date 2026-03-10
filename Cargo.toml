@@ -21,6 +21,7 @@ members = [
   "crates/cuda",
   "crates/curves",
   "crates/derive",
+  "crates/germ",
   "crates/helper",
   "crates/hypercube",
   "crates/perf",
@@ -112,6 +113,7 @@ sp1-core-machine = { version = "6.0.2", path = "crates/core/machine" }
 sp1-cuda = { version = "6.0.2", path = "crates/cuda" }
 sp1-curves = { version = "6.0.2", path = "crates/curves" }
 sp1-derive = { version = "6.0.2", path = "crates/derive" }
+sp1-germ = { version = "6.0.2", path = "crates/germ" }
 # sp1-eval = { version = "6.0.2", path = "crates/eval" }
 sp1-helper = { version = "6.0.2", path = "crates/helper", default-features = false }
 sp1-hypercube = { version = "6.0.2", path = "crates/hypercube" }

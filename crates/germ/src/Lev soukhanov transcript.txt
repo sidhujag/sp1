@@ -1,0 +1,134 @@
+Lev soukhanov: rough explanation is that we have this notion of ADP program
+
+it is a collection of matrices M_0, ..., M_n
+
+given witness w_0, ..., w_n you compute
+
+det(\sum w_i M_i)
+
+and if det=0 it means program accepted input, and det != 0 means it rejected input
+yeah, this is just an arithmetic circuit
+
+similar to r1cs
+it is not booleanized
+
+in original ADP it is
+
+but for us it is arithmetic
+
+this is like THE reason we are trillion times more efficient
+original ADPs were cool, but we counted and it was not good enough
+
+so we did arithmetic circuits and this is main big point
+
+so how it works is that each gate (which all have slightly more general form than r1cs, they look like ab=cd for some linear combinations a, b, c, d) corresponds to some term in all M_i-s
+
+basically each M_i is secretly sum of many matrices, let's call M_i^j one this matrix. j corresponds to gate index
+
+ok?
+now, the main instrument is rank additivity
+
+when you compute individual gate contribution CONTRIB^j = \sum w_i M_i^j then this CONTRIB^j has following property
+
+1. when gate j holds, this matrix has rank 2 with overwhelming probability
+2. when gate j is broken, this matrix has rank 4
+public inputs, they are baked in circuit structure
+
+so let me continue. this ADP is morally analogue of something like groth, WE is built from this
+so anyway totally these matrices are 2m+1 x 2m+1
+
+so if all gates hold, each contribute rank 2 and by rank (sub)additivity we get rank 2m
+
+but if even one is broken, we get rank 2m+1 and det != 0
+it is standalone construction
+
+downside is it is not reduced to any standard assumption
+
+but upside is that it is by far, orders of magnitude more efficient than pretty much everything
+
+hm, so information asymmetry is how these M-s are split into these submatrices
+
+basically it is a specific instance of minrank - how to combine matrices in a way that rank drops
+well, I can explain why analogous attack doesn't directly apply
+answer is very simple: det is large degree.
+well..... basically the way the groth16-attack works is finding linear relations between images of your "gadget" (modified groth16 formula)
+or rather finding relations between error vectors, and then applying the same to your "gadget" evals
+so natural idea is come up with other constraint system that has much higher degree and lives in the ideal of original one
+
+- then attacker will need to cancel out insanely large dimension of the error vector
+exponential in degree, in fact
+well ADPs were invented long ago, but we made this connection that this kinda makes sense
+sooo ok, there are few things I didn't say
+
+for example I didn't say how WE works
+
+but anyway, long story short, this thing is not safe for all circuits
+
+main reason is because attacker can give you evals that have w_0=0
+
+and these sort of "count" like correct witnesses
+so we have this condition called projective safety, and this is ridiculously restrictive
+after you published this thing attacker can do any linear combinations
+
+armers in this context are just mpc for setup, or smth like that
+if your circuit has these degenerate solutions (many of them), its gg
+well, instance of ADP corresponds to circuit
+
+secure circuits are those that satisfy our condition called "projective safety"
+
+it means no satisfying assignments with x0=0
+
+so you cant multiply 2 numbers :DDDDD it is ridiculously stupid how hard is to write circuits under this condition
+
+because if you make gate ab=c
+
+then it is actually ab = c * 1
+
+so it is actually ab = c * x_0
+
+so if you put x_0 = 0
+
+we considered lattices + GKR and WHIR
+let me give you some numbers
+
+this scheme has circuit size ~15000
+
+ciphertext is 340 TB
+
+it scales cubically
+
+best case that I was able to do for WHIR is 50x worse
+
+so it would be 125,000 x 340 TB
+
+which is QUITE A LOT :)
+basically if you once read my paper, you will see how optimized these circuits are
+
+it was a ridiculous task
+
+I used every optimization I could
+
+and this was in the world when I can not multiply and instead need to do weird square-root shit
+...ike I can't do ab=c
+
+but can ab=c^2, well, we have better scheme but less sure if its secure
+it uses matrices with special structure
+
+well, I think these circuits are 80-90% optimal
+
+but you need to understand I probably was first ever person writing circuits in this model
+secret message is added to a single cell in matrix M_0
+decryptor modifies matrix with formal variable (writes -t) in this cell
+
+then runs ADP, and determinant is linear equation in t
+
+it solves it, and gets back the message
+
+so it is "find such t that this det=0" basically masked ADP
+oh this was from the original paper, we didnt change this part
+
+our job pretty much was to figure out how to use arithmetic circuits instead of boolean ones
+
+which was nontrivial by itself
+
+but tbh I think it is fairly straightforward

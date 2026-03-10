@@ -3,6 +3,7 @@ use crate::{
         get_or_create_groth16_artifacts_dev_build_dir, get_or_create_plonk_artifacts_dev_build_dir,
         try_install_circuit_artifacts, use_development_mode,
     },
+    germ_bridge::{build_sp1_germ_bridge_from_recursion_proof, Sp1GermBridge},
     recursion::{
         compose_program_from_input, deferred_program_from_input, dummy_deferred_input,
         recursive_verifier, shrink_program_from_input, wrap_program_from_input, RecursionVks,
@@ -1085,6 +1086,17 @@ impl<C: SP1ProverComponents> ShrinkProver<C> {
             .await;
         let vk_merkle_proof = self.prover_data.recursion_vks.open(&vk)?.1;
         Ok(SP1RecursionProof { vk: self.verifying_key.clone(), proof, vk_merkle_proof })
+    }
+
+    pub async fn prove_with_bridge(
+        &self,
+        compressed_proof: SP1RecursionProof<SP1GlobalContext, SP1PcsProofInner>,
+    ) -> Result<(SP1RecursionProof<SP1GlobalContext, SP1PcsProofInner>, Sp1GermBridge), TaskError>
+    {
+        let shrink_proof = self.prove(compressed_proof).await?;
+        let bridge =
+            build_sp1_germ_bridge_from_recursion_proof(&shrink_proof).map_err(TaskError::Fatal)?;
+        Ok((shrink_proof, bridge))
     }
 
     fn verify(
