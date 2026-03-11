@@ -6770,6 +6770,8 @@ name = "sp1-germ"
 version = "6.0.2"
 dependencies = [
  "rand 0.8.5",
+ "rayon",
+ "serde",
  "sha2",
  "slop-algebra",
  "sp1-primitives",
@@ -7494,11 +7496,13 @@ dependencies = [
  "slop-jagged",
  "slop-multilinear",
  "slop-stacked",
+ "slop-sumcheck",
  "slop-symmetric",
  "sp1-core-executor",
  "sp1-core-executor-runner",
  "sp1-core-machine",
  "sp1-derive",
+ "sp1-germ",
  "sp1-hypercube",
  "sp1-jit",
  "sp1-primitives",

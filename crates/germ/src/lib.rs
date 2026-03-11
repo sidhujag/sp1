@@ -9,20 +9,19 @@
 //! - tiny-verifier AADP constraint compilation
 //! - paper-style AADP matrix encryption/decryption helpers
 
-mod ajtai;
 pub mod aadp;
+mod ajtai;
 pub mod bundle;
 pub mod germ;
 
 pub use aadp::{
-    aadp_encrypt_bytes, aadp_encrypt_scalar, aadp_encrypt_u128, AadpByteCiphertext,
-    AadpCiphertext, AadpConstraintSystem, AadpField, AadpLinearForm, AadpMulConstraint,
-    Sp1AadpField,
+    aadp_encrypt_bytes, aadp_encrypt_scalar, aadp_encrypt_u128, AadpByteCiphertext, AadpCiphertext,
+    AadpConstraintSystem, AadpField, AadpLinearForm, AadpMulConstraint, Sp1AadpField,
 };
 pub use bundle::{
-    GermArmCapsule, GermResidualPlan, GermVerifierStage, Sp1GermBundle, Sp1GermProofObject,
-    Sp1LinProof, Sp1LinTerm, Sp1MulSumcheckProof, Sp1MulSumcheckRound, Sp1MulTerm,
-    TranscriptBoundSp1GermProofObject,
+    GermArmCapsule, GermResidualPlan, GermVerifierStage, LinearResidualDescriptor,
+    MultiplicativeResidualDescriptor, Sp1GermBundle, Sp1GermProofObject, Sp1LinProof, Sp1LinTerm,
+    Sp1MulSumcheckProof, Sp1MulSumcheckRound, Sp1MulTerm, TranscriptBoundSp1GermProofObject,
 };
 pub use germ::{
     arm_germ_aadp_template, bind_bundle, bind_bundle_to_capsule, compile_germ_aadp_template,

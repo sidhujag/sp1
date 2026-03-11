@@ -1,11 +1,59 @@
+use crate::ajtai::{PACKAGE_AJTAI_RING_DIM, PACKAGE_AJTAI_ROWS};
+use sha2::Digest;
 use slop_algebra::{AbstractExtensionField, AbstractField};
 use sp1_primitives::{SP1ExtensionField, SP1Field};
 
-pub type Sp1PackageCommitment = [[SP1ExtensionField; 4]; 4];
+pub type Sp1PackageCommitment =
+    [[SP1ExtensionField; PACKAGE_AJTAI_RING_DIM]; PACKAGE_AJTAI_ROWS];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum GermVerifierStage {
     Compressed,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum LinearResidualDescriptor {
+    /// Generic linear term `(coefficient, value)`.
+    Explicit,
+    /// SP1 recursion public-value padding expands to `count` unit-coefficient terms.
+    PublicValuesPadding {
+        start_idx: usize,
+        count: usize,
+    },
+    RecursionPublicValuesDigest,
+    IsComplete,
+    ZerocheckPointEval,
+    ZerocheckClaimedSum,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum MultiplicativeResidualDescriptor {
+    /// Generic multiplicative term `(a, b, c, d)`.
+    Explicit,
+    DegreeBitBooleanity {
+        chip_name: String,
+        bit_idx: usize,
+    },
+    DegreeHeightProduct {
+        chip_name: String,
+        bit_idx: usize,
+    },
+    GkrPowWitness,
+    GkrCumulativeSum,
+    GkrDenominatorInverse {
+        index: usize,
+    },
+    GkrRoundClaimedSum {
+        round_idx: usize,
+    },
+    GkrRoundFinalEval {
+        round_idx: usize,
+    },
+    GkrTracePointCoord {
+        coord_idx: usize,
+    },
+    GkrFinalNumeratorEval,
+    GkrFinalDenominatorEval,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -16,9 +64,67 @@ pub struct GermResidualPlan {
     pub sumcheck_rounds: u16,
     pub linear_opening_rows: u16,
     pub linear_opening_ring_dim: u16,
+    pub linear_descriptors: Vec<LinearResidualDescriptor>,
+    pub multiplicative_descriptors: Vec<MultiplicativeResidualDescriptor>,
 }
 
 impl GermResidualPlan {
+    #[must_use]
+    pub fn new(
+        schedule_descriptor_digest: [u8; 32],
+        verifier_stage: GermVerifierStage,
+        sumcheck_rounds: u16,
+        linear_opening_rows: u16,
+        linear_opening_ring_dim: u16,
+        linear_descriptors: Vec<LinearResidualDescriptor>,
+        multiplicative_descriptors: Vec<MultiplicativeResidualDescriptor>,
+    ) -> Self {
+        let mut plan = Self {
+            schedule_descriptor_digest,
+            residual_plan_digest: [0u8; 32],
+            verifier_stage,
+            sumcheck_rounds,
+            linear_opening_rows,
+            linear_opening_ring_dim,
+            linear_descriptors,
+            multiplicative_descriptors,
+        };
+        plan.residual_plan_digest = plan.descriptor_set_digest();
+        plan
+    }
+
+    #[must_use]
+    pub fn descriptor_set_digest(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+
+        let mut h = Sha256::new();
+        h.update(b"sp1-germ/residual-descriptor-set/v2");
+        h.update(self.schedule_descriptor_digest);
+        h.update(match self.verifier_stage {
+            GermVerifierStage::Compressed => b"compressed".as_slice(),
+        });
+        h.update(self.sumcheck_rounds.to_le_bytes());
+        h.update(self.linear_opening_rows.to_le_bytes());
+        h.update(self.linear_opening_ring_dim.to_le_bytes());
+        h.update((self.linear_descriptors.len() as u64).to_le_bytes());
+        for descriptor in &self.linear_descriptors {
+            hash_linear_residual_descriptor(&mut h, descriptor);
+        }
+        h.update((self.multiplicative_descriptors.len() as u64).to_le_bytes());
+        for descriptor in &self.multiplicative_descriptors {
+            hash_multiplicative_residual_descriptor(&mut h, descriptor);
+        }
+        let digest = h.finalize();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&digest);
+        out
+    }
+
+    #[must_use]
+    pub fn has_valid_descriptor_digest(&self) -> bool {
+        self.residual_plan_digest == self.descriptor_set_digest()
+    }
+
     #[must_use]
     pub fn digest(&self) -> [u8; 32] {
         use sha2::{Digest, Sha256};
@@ -37,6 +143,85 @@ impl GermResidualPlan {
         let mut out = [0u8; 32];
         out.copy_from_slice(&digest);
         out
+    }
+}
+
+fn hash_string(h: &mut sha2::Sha256, value: &str) {
+    h.update((value.len() as u64).to_le_bytes());
+    h.update(value.as_bytes());
+}
+
+fn hash_linear_residual_descriptor(h: &mut sha2::Sha256, descriptor: &LinearResidualDescriptor) {
+    match descriptor {
+        LinearResidualDescriptor::Explicit => {
+            h.update(b"linear-explicit");
+        }
+        LinearResidualDescriptor::PublicValuesPadding { start_idx, count } => {
+            h.update(b"linear-public-values-padding");
+            h.update((*start_idx as u64).to_le_bytes());
+            h.update((*count as u64).to_le_bytes());
+        }
+        LinearResidualDescriptor::RecursionPublicValuesDigest => {
+            h.update(b"linear-recursion-public-values-digest");
+        }
+        LinearResidualDescriptor::IsComplete => {
+            h.update(b"linear-is-complete");
+        }
+        LinearResidualDescriptor::ZerocheckPointEval => {
+            h.update(b"linear-zerocheck-point-eval");
+        }
+        LinearResidualDescriptor::ZerocheckClaimedSum => {
+            h.update(b"linear-zerocheck-claimed-sum");
+        }
+    }
+}
+
+fn hash_multiplicative_residual_descriptor(
+    h: &mut sha2::Sha256,
+    descriptor: &MultiplicativeResidualDescriptor,
+) {
+    match descriptor {
+        MultiplicativeResidualDescriptor::Explicit => {
+            h.update(b"mul-explicit");
+        }
+        MultiplicativeResidualDescriptor::DegreeBitBooleanity { chip_name, bit_idx } => {
+            h.update(b"mul-degree-bit-booleanity");
+            hash_string(h, chip_name);
+            h.update((*bit_idx as u64).to_le_bytes());
+        }
+        MultiplicativeResidualDescriptor::DegreeHeightProduct { chip_name, bit_idx } => {
+            h.update(b"mul-degree-height-product");
+            hash_string(h, chip_name);
+            h.update((*bit_idx as u64).to_le_bytes());
+        }
+        MultiplicativeResidualDescriptor::GkrPowWitness => {
+            h.update(b"mul-gkr-pow-witness");
+        }
+        MultiplicativeResidualDescriptor::GkrCumulativeSum => {
+            h.update(b"mul-gkr-cumulative-sum");
+        }
+        MultiplicativeResidualDescriptor::GkrDenominatorInverse { index } => {
+            h.update(b"mul-gkr-denominator-inverse");
+            h.update((*index as u64).to_le_bytes());
+        }
+        MultiplicativeResidualDescriptor::GkrRoundClaimedSum { round_idx } => {
+            h.update(b"mul-gkr-round-claimed-sum");
+            h.update((*round_idx as u64).to_le_bytes());
+        }
+        MultiplicativeResidualDescriptor::GkrRoundFinalEval { round_idx } => {
+            h.update(b"mul-gkr-round-final-eval");
+            h.update((*round_idx as u64).to_le_bytes());
+        }
+        MultiplicativeResidualDescriptor::GkrTracePointCoord { coord_idx } => {
+            h.update(b"mul-gkr-trace-point-coord");
+            h.update((*coord_idx as u64).to_le_bytes());
+        }
+        MultiplicativeResidualDescriptor::GkrFinalNumeratorEval => {
+            h.update(b"mul-gkr-final-numerator-eval");
+        }
+        MultiplicativeResidualDescriptor::GkrFinalDenominatorEval => {
+            h.update(b"mul-gkr-final-denominator-eval");
+        }
     }
 }
 
@@ -87,10 +272,8 @@ impl Sp1LinTerm {
 pub struct Sp1LinProof {
     pub term_count: u32,
     pub folded_residual: SP1ExtensionField,
-    /// Ajtai-style ring commitment rows for the opened linear proof message.
-    pub ajtai_commitment: [[SP1ExtensionField; 4]; 4],
-    /// Batched projection residuals authenticating the shared-object commitment `C`.
-    pub package_opening_projection: [SP1ExtensionField; 2],
+    /// Opened commitment rows; must match the common commitment `C` coordinate-wise.
+    pub ajtai_commitment: Sp1PackageCommitment,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,7 +286,12 @@ pub struct Sp1MulTerm {
 
 impl Sp1MulTerm {
     #[must_use]
-    pub fn new(a: SP1ExtensionField, b: SP1ExtensionField, c: SP1ExtensionField, d: SP1ExtensionField) -> Self {
+    pub fn new(
+        a: SP1ExtensionField,
+        b: SP1ExtensionField,
+        c: SP1ExtensionField,
+        d: SP1ExtensionField,
+    ) -> Self {
         Self { a, b, c, d }
     }
 }
@@ -160,9 +348,12 @@ impl Default for Sp1MulSumcheckProof {
 /// The caller is responsible for extracting these fields from a concrete proof object.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sp1GermBundle {
-    /// Canonical bytes for the shared object `O` to be committed into `C`.
+    /// Canonical bytes for the extracted SP1 bridge object.
+    ///
+    /// Kept for host-side export/debug parity; commitment `C` is derived from
+    /// transcript term vectors (`lin_terms`, `mul_terms`), not these bytes.
     pub shared_object: Vec<u8>,
-    /// Deterministic Ajtai-style commitment object for `shared_object`.
+    /// Deterministic commitment object `C = Com(T)` over exported transcript terms.
     pub shared_object_commitment: Sp1PackageCommitment,
     /// Terms for linear relation checks.
     pub lin_terms: Vec<Sp1LinTerm>,
@@ -171,7 +362,7 @@ pub struct Sp1GermBundle {
     /// Proof bytes for the linear opening path.
     ///
     /// In the current SP1-native GERM layer this is the canonical encoding of
-    /// `Sp1LinProof` (claim value + Ajtai opening payload).
+    /// `Sp1LinProof` (claim value + commitment opening payload).
     pub pi_lin: Vec<u8>,
     /// Proof bytes for the multiplicative opening path.
     ///
@@ -227,7 +418,7 @@ impl Sp1GermBundle {
                 SP1Field::zero(),
                 SP1Field::zero(),
                 SP1Field::zero(),
-            ]); 4]; 4],
+            ]); PACKAGE_AJTAI_RING_DIM]; PACKAGE_AJTAI_ROWS],
             lin_terms,
             mul_terms,
             pi_lin,

@@ -1,16 +1,16 @@
-use sha2::{Digest, Sha256};
 use rand::{rngs::StdRng, SeedableRng};
+use sha2::{Digest, Sha256};
 use slop_algebra::{AbstractExtensionField, AbstractField};
 use sp1_germ::{
-    arm_germ_aadp_template, bind_bundle_to_capsule, materialize_transcript_bound_germ_aadp_witness, verify_lin,
-    verify_mul, AadpField, GermPublicValues, GermResidualPlan, GermVerifierStage, Sp1AadpField,
-    Sp1GermBundle, Sp1LinTerm, Sp1MulTerm, TranscriptBoundSp1GermProofObject,
+    arm_germ_aadp_template, bind_bundle_to_capsule, materialize_transcript_bound_germ_aadp_witness,
+    verify_lin, verify_mul, AadpField, GermPublicValues, GermResidualPlan, GermVerifierStage,
+    LinearResidualDescriptor, MultiplicativeResidualDescriptor, Sp1AadpField, Sp1GermBundle,
+    Sp1LinTerm, Sp1MulTerm, TranscriptBoundSp1GermProofObject,
 };
 use sp1_primitives::{SP1ExtensionField, SP1Field};
 
 fn ext_from_word(x: u32) -> SP1ExtensionField {
-    let limbs: [SP1Field; 4] =
-        core::array::from_fn(|i| SP1Field::from_canonical_u32(x + i as u32));
+    let limbs: [SP1Field; 4] = core::array::from_fn(|i| SP1Field::from_canonical_u32(x + i as u32));
     SP1ExtensionField::from_base_slice(&limbs)
 }
 
@@ -56,14 +56,18 @@ fn main() {
         share_index: 0,
         share_domain_separator,
     };
-    let residual_plan = GermResidualPlan {
-        schedule_descriptor_digest: descriptor_digest,
-        residual_plan_digest: sha2::Sha256::digest(b"example-residual-plan-v1").into(),
-        verifier_stage: GermVerifierStage::Compressed,
-        sumcheck_rounds: 1,
-        linear_opening_rows: 4,
-        linear_opening_ring_dim: 4,
-    };
+    let residual_plan = GermResidualPlan::new(
+        descriptor_digest,
+        GermVerifierStage::Compressed,
+        1,
+        4,
+        4,
+        vec![LinearResidualDescriptor::Explicit],
+        vec![
+            MultiplicativeResidualDescriptor::Explicit,
+            MultiplicativeResidualDescriptor::Explicit,
+        ],
+    );
     let capsule = public_values.arm_capsule(&residual_plan);
 
     // Arm stage: derive key material from arming metadata only (independent of future root/proof).
@@ -82,7 +86,7 @@ fn main() {
     seed16.copy_from_slice(&arm_seed[..16]);
     let aadp_msg = <Sp1AadpField as AadpField>::from_u128(u128::from_le_bytes(seed16));
     let mut rng = StdRng::from_seed(arm_seed);
-    let armed = arm_germ_aadp_template(&capsule, aadp_msg, &mut rng)
+    let armed = arm_germ_aadp_template(&capsule, &residual_plan, aadp_msg, &mut rng)
         .expect("arm pre-proof GERM/AADP template");
     assert!(armed.template.stats.multiplication_gates >= 2);
 
@@ -104,8 +108,8 @@ fn main() {
         bind_bundle_to_capsule(&mut bundle, &capsule).expect("bundle binding");
     // These checks enforce the global mixed vanishing claims:
     //   V_lin(r_lin) = 0, V_mul(r_mul) = 0.
-    let _lin_check = verify_lin(&bundle, &public_values, &commitment_root)
-        .expect("linear check should verify");
+    let _lin_check =
+        verify_lin(&bundle, &public_values, &commitment_root).expect("linear check should verify");
     let _mul_check = verify_mul(&bundle, &public_values, &commitment_root)
         .expect("multiplicative check should verify");
     let transcript_bound = TranscriptBoundSp1GermProofObject::new(bundle, commitment_root);

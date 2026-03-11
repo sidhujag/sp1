@@ -5,6 +5,7 @@
 use core::ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign};
 
 use rand::RngCore;
+use rayon::prelude::*;
 use slop_algebra::{AbstractExtensionField, AbstractField, Field, PrimeField32};
 use sp1_primitives::{SP1ExtensionField, SP1Field};
 
@@ -49,9 +50,8 @@ fn sp1_ext_from_u128(mut value: u128) -> SP1ExtensionField {
 fn sp1_ext_to_u128(value: &SP1ExtensionField) -> Result<u128, String> {
     let radix = SP1Field::ORDER_U32 as u128;
     let mut acc = 0u128;
-    for limb in <SP1ExtensionField as AbstractExtensionField<SP1Field>>::as_base_slice(value)
-        .iter()
-        .rev()
+    for limb in
+        <SP1ExtensionField as AbstractExtensionField<SP1Field>>::as_base_slice(value).iter().rev()
     {
         let digit = limb.as_canonical_u32() as u128;
         acc = acc
@@ -162,11 +162,7 @@ pub struct AadpConstraintSystem<F: AadpField> {
 impl<F: AadpField> AadpConstraintSystem<F> {
     #[must_use]
     pub fn matrix_dim(&self) -> usize {
-        self.constraints
-            .len()
-            .checked_mul(2)
-            .and_then(|x| x.checked_add(1))
-            .unwrap_or(1)
+        self.constraints.len().checked_mul(2).and_then(|x| x.checked_add(1)).unwrap_or(1)
     }
 
     pub fn check_witness(&self, witness: &[F]) -> Result<(), String> {
@@ -258,9 +254,9 @@ impl<F: AadpField> AadpCiphertext<F> {
         if coeff.is_zero() {
             return Err("AADP decrypt failed: bottom-right cofactor is zero".to_string());
         }
-        let inv = coeff
-            .inverse()
-            .ok_or_else(|| "AADP decrypt failed: missing inverse for nonzero cofactor".to_string())?;
+        let inv = coeff.inverse().ok_or_else(|| {
+            "AADP decrypt failed: missing inverse for nonzero cofactor".to_string()
+        })?;
         Ok(det_eval * inv)
     }
 
@@ -299,49 +295,53 @@ pub fn aadp_encrypt_scalar<F: AadpField, R: RngCore>(
         return Err("AADP requires at least one constraint".to_string());
     }
     let dim = cs.matrix_dim();
-    let nn = dim
-        .checked_mul(dim)
-        .ok_or_else(|| "AADP dim^2 overflow".to_string())?;
+    let nn = dim.checked_mul(dim).ok_or_else(|| "AADP dim^2 overflow".to_string())?;
     let mut matrices = vec![vec![F::zero(); nn]; cs.num_variables + 1];
+    let mut l = vec![F::zero(); dim * 4];
+    let mut r = vec![F::zero(); 4 * dim];
+    let mut b_a = vec![F::zero(); nn];
+    let mut b_b = vec![F::zero(); nn];
+    let mut b_c = vec![F::zero(); nn];
+    let mut b_d = vec![F::zero(); nn];
+    let mut b_xi = vec![F::zero(); nn];
+    let mut xi_coeffs = vec![F::zero(); cs.num_variables];
 
     for constraint in &cs.constraints {
-        let l = random_matrix::<F, R>(dim, 4, rng);
-        let r = random_matrix::<F, R>(4, dim, rng);
+        fill_random_matrix(l.as_mut_slice(), rng);
+        fill_random_matrix(r.as_mut_slice(), rng);
 
-        let b_a = basis_matrix_contribution::<F>(dim, &l, &r, AadpBasis::A)?;
-        let b_b = basis_matrix_contribution::<F>(dim, &l, &r, AadpBasis::B)?;
-        let b_c = basis_matrix_contribution::<F>(dim, &l, &r, AadpBasis::C)?;
-        let b_d = basis_matrix_contribution::<F>(dim, &l, &r, AadpBasis::D)?;
-        let b_xi = basis_matrix_contribution::<F>(dim, &l, &r, AadpBasis::Xi)?;
+        basis_matrix_contributions_in_place(
+            dim,
+            l.as_slice(),
+            r.as_slice(),
+            b_a.as_mut_slice(),
+            b_b.as_mut_slice(),
+            b_c.as_mut_slice(),
+            b_d.as_mut_slice(),
+            b_xi.as_mut_slice(),
+        )?;
 
         add_linear_form_to_matrices(matrices.as_mut_slice(), &constraint.a, b_a.as_slice())?;
         add_linear_form_to_matrices(matrices.as_mut_slice(), &constraint.b, b_b.as_slice())?;
         add_linear_form_to_matrices(matrices.as_mut_slice(), &constraint.c, b_c.as_slice())?;
         add_linear_form_to_matrices(matrices.as_mut_slice(), &constraint.d, b_d.as_slice())?;
 
-        let mut xi = AadpLinearForm::<F> {
-            constant: F::rand(rng),
-            terms: Vec::with_capacity(cs.num_variables),
-        };
-        for idx in 0..cs.num_variables {
-            xi.terms.push((idx, F::rand(rng)));
+        let xi_constant = F::rand(rng);
+        for coeff in xi_coeffs.iter_mut() {
+            *coeff = F::rand(rng);
         }
-        add_linear_form_to_matrices(matrices.as_mut_slice(), &xi, b_xi.as_slice())?;
+        add_dense_linear_form_to_matrices(
+            matrices.as_mut_slice(),
+            xi_constant,
+            xi_coeffs.as_slice(),
+            b_xi.as_slice(),
+        )?;
     }
 
     let last = dim - 1;
     matrices[0][last * dim + last] += msg;
 
     Ok(AadpCiphertext { num_variables: cs.num_variables, dim, matrices })
-}
-
-#[derive(Clone, Copy)]
-enum AadpBasis {
-    A,
-    B,
-    C,
-    D,
-    Xi,
 }
 
 fn add_linear_form_to_matrices<F: AadpField>(
@@ -372,39 +372,86 @@ fn add_linear_form_to_matrices<F: AadpField>(
     Ok(())
 }
 
-fn basis_matrix_contribution<F: AadpField>(
+fn add_dense_linear_form_to_matrices<F: AadpField>(
+    matrices: &mut [Vec<F>],
+    constant: F,
+    coeffs: &[F],
+    basis_matrix: &[F],
+) -> Result<(), String> {
+    if matrices.is_empty() {
+        return Err("AADP matrices are empty".to_string());
+    }
+    if matrices[0].len() != basis_matrix.len() {
+        return Err("AADP basis matrix size mismatch".to_string());
+    }
+    if matrices.len() != coeffs.len() + 1 {
+        return Err(format!(
+            "AADP dense form length mismatch: matrices={} coeffs={}",
+            matrices.len(),
+            coeffs.len()
+        ));
+    }
+
+    for (dst, src) in matrices[0].iter_mut().zip(basis_matrix.iter()) {
+        *dst += *src * constant;
+    }
+
+    matrices[1..].par_iter_mut().zip(coeffs.par_iter().copied()).for_each(|(dst, coeff)| {
+        for (d, s) in dst.iter_mut().zip(basis_matrix.iter()) {
+            *d += *s * coeff;
+        }
+    });
+
+    Ok(())
+}
+
+fn basis_matrix_contributions_in_place<F: AadpField>(
     dim: usize,
     l: &[F],
     r: &[F],
-    basis: AadpBasis,
-) -> Result<Vec<F>, String> {
+    out_a: &mut [F],
+    out_b: &mut [F],
+    out_c: &mut [F],
+    out_d: &mut [F],
+    out_xi: &mut [F],
+) -> Result<(), String> {
     if l.len() != dim * 4 || r.len() != 4 * dim {
         return Err("AADP L/R shape mismatch".to_string());
     }
-    let mut out = vec![F::zero(); dim * dim];
+    let nn = dim.checked_mul(dim).ok_or_else(|| "AADP dim^2 overflow".to_string())?;
+    if out_a.len() != nn
+        || out_b.len() != nn
+        || out_c.len() != nn
+        || out_d.len() != nn
+        || out_xi.len() != nn
+    {
+        return Err("AADP basis output size mismatch".to_string());
+    }
     for row in 0..dim {
+        let l0 = l[row * 4];
+        let l1 = l[row * 4 + 1];
+        let l2 = l[row * 4 + 2];
+        let l3 = l[row * 4 + 3];
         for col in 0..dim {
-            let v = match basis {
-                AadpBasis::A => l[row * 4] * r[col] + l[row * 4 + 3] * r[3 * dim + col],
-                AadpBasis::B => l[row * 4 + 1] * r[dim + col] + l[row * 4 + 2] * r[2 * dim + col],
-                AadpBasis::C => l[row * 4] * r[dim + col] + l[row * 4 + 2] * r[3 * dim + col],
-                AadpBasis::D => l[row * 4 + 1] * r[col] + l[row * 4 + 3] * r[2 * dim + col],
-                AadpBasis::Xi => {
-                    -l[row * 4] * r[2 * dim + col] + l[row * 4 + 1] * r[3 * dim + col]
-                }
-            };
-            out[row * dim + col] = v;
+            let idx = row * dim + col;
+            let r0 = r[col];
+            let r1 = r[dim + col];
+            let r2 = r[2 * dim + col];
+            let r3 = r[3 * dim + col];
+            out_a[idx] = l0 * r0 + l3 * r3;
+            out_b[idx] = l1 * r1 + l2 * r2;
+            out_c[idx] = l0 * r1 + l2 * r3;
+            out_d[idx] = l1 * r0 + l3 * r2;
+            out_xi[idx] = -(l0 * r2) + (l1 * r3);
         }
     }
-    Ok(out)
+    Ok(())
 }
 
-fn random_matrix<F: AadpField, R: RngCore>(rows: usize, cols: usize, rng: &mut R) -> Vec<F> {
-    let mut out = Vec::with_capacity(rows * cols);
-    for _ in 0..rows * cols {
-        out.push(F::rand(rng));
+fn fill_random_matrix<F: AadpField, R: RngCore>(out: &mut [F], rng: &mut R) {
+    for slot in out.iter_mut() {
+        *slot = F::rand(rng);
     }
-    out
 }
 
 fn determinant<F: AadpField>(dim: usize, data: &[F]) -> Result<F, String> {

@@ -12,7 +12,8 @@ use slop_multilinear::{
 use slop_sumcheck::partially_verify_sumcheck_proof;
 use sp1_germ::{
     bind_bundle_to_capsule, compute_commitment_root, GermArmCapsule, GermResidualPlan,
-    GermVerifierStage, Sp1GermProofObject, Sp1LinTerm, Sp1MulTerm,
+    GermVerifierStage, LinearResidualDescriptor, MultiplicativeResidualDescriptor,
+    Sp1GermProofObject, Sp1LinTerm, Sp1MulTerm,
 };
 use sp1_hypercube::{
     air::MachineAir, LogUpEvaluations, LogUpGkrVerifier, MachineRecord, SP1PcsProofInner, SP1RecursionProof,
@@ -64,46 +65,6 @@ pub struct ResidualPlanV1 {
     pub linear_opening_ring_dim: u16,
     pub exported_linear_families: Vec<String>,
     pub exported_multiplicative_families: Vec<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub enum LinearResidualDescriptor {
-    PublicValuesPadding {
-        start_idx: usize,
-        count: usize,
-    },
-    RecursionPublicValuesDigest,
-    IsComplete,
-    ZerocheckPointEval,
-    ZerocheckClaimedSum,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub enum MultiplicativeResidualDescriptor {
-    DegreeBitBooleanity {
-        chip_name: String,
-        bit_idx: usize,
-    },
-    DegreeHeightProduct {
-        chip_name: String,
-        bit_idx: usize,
-    },
-    GkrPowWitness,
-    GkrCumulativeSum,
-    GkrDenominatorInverse {
-        index: usize,
-    },
-    GkrRoundClaimedSum {
-        round_idx: usize,
-    },
-    GkrRoundFinalEval {
-        round_idx: usize,
-    },
-    GkrTracePointCoord {
-        coord_idx: usize,
-    },
-    GkrFinalNumeratorEval,
-    GkrFinalDenominatorEval,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -359,31 +320,6 @@ fn default_residual_plan_v1(schedule_descriptor_digest: [u8; 32]) -> ResidualPla
     }
 }
 
-fn digest_residual_plan(plan: &ResidualPlanV1) -> Result<[u8; 32]> {
-    let bytes = serde_json::to_vec(plan).context("serialize residual plan")?;
-    let digest = Sha256::digest(bytes);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&digest);
-    Ok(out)
-}
-
-fn digest_residual_descriptor_set(
-    descriptor: &BridgeDescriptorV2,
-) -> Result<[u8; 32]> {
-    let mut h = Sha256::new();
-    h.update(b"sp1-germ/residual-descriptor-set/v1");
-    h.update(digest_residual_plan(&descriptor.residual_plan)?);
-    h.update(serde_json::to_vec(&descriptor.linear_descriptors).context("serialize linear descriptors")?);
-    h.update(
-        serde_json::to_vec(&descriptor.multiplicative_descriptors)
-            .context("serialize multiplicative descriptors")?,
-    );
-    let digest = h.finalize();
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&digest);
-    Ok(out)
-}
-
 pub fn sp1_germ_schedule_descriptor_digest() -> Result<[u8; 32]> {
     let reduce_shape = SP1RecursionProofShape::compress_proof_shape_from_arity(DEFAULT_ARITY)
         .context("default SP1 recursion arity schedule should exist")?;
@@ -436,15 +372,15 @@ pub fn sp1_germ_bridge_descriptor_v2() -> Result<BridgeDescriptorV2> {
 
 pub fn sp1_germ_residual_plan() -> Result<GermResidualPlan> {
     let descriptor = sp1_germ_bridge_descriptor_v2()?;
-    let residual_plan_digest = digest_residual_descriptor_set(&descriptor)?;
-    Ok(GermResidualPlan {
-        schedule_descriptor_digest: descriptor.schedule_descriptor_digest,
-        residual_plan_digest,
-        verifier_stage: GermVerifierStage::Compressed,
-        sumcheck_rounds: descriptor.residual_plan.sumcheck_rounds,
-        linear_opening_rows: descriptor.residual_plan.linear_opening_rows,
-        linear_opening_ring_dim: descriptor.residual_plan.linear_opening_ring_dim,
-    })
+    Ok(GermResidualPlan::new(
+        descriptor.schedule_descriptor_digest,
+        GermVerifierStage::Compressed,
+        descriptor.residual_plan.sumcheck_rounds,
+        descriptor.residual_plan.linear_opening_rows,
+        descriptor.residual_plan.linear_opening_ring_dim,
+        descriptor.linear_descriptors,
+        descriptor.multiplicative_descriptors,
+    ))
 }
 
 fn export_linear_residual_terms_from_recursion_proof(
@@ -629,6 +565,11 @@ fn export_linear_residual_terms_from_recursion_proof(
         .fold(ext_zero(), |acc, modification| lambda * acc + *modification);
     for descriptor in descriptors {
         match descriptor {
+            LinearResidualDescriptor::Explicit => {
+                return Err(anyhow!(
+                    "explicit linear descriptors are not supported by the SP1 recursion exporter"
+                ));
+            }
             LinearResidualDescriptor::PublicValuesPadding { start_idx, count } => {
                 for value in shard_proof.public_values[start_idx..start_idx + count].iter().copied() {
                     push_linear_residual(&mut linear_terms, base_to_ext(value));
@@ -882,6 +823,11 @@ fn export_multiplicative_residual_terms_from_recursion_proof(
 
     for descriptor in descriptors {
         match descriptor {
+            MultiplicativeResidualDescriptor::Explicit => {
+                return Err(anyhow!(
+                    "explicit multiplicative descriptors are not supported by the SP1 recursion exporter"
+                ));
+            }
             MultiplicativeResidualDescriptor::DegreeBitBooleanity { chip_name, bit_idx } => {
                 let openings = shard_proof
                     .opened_values

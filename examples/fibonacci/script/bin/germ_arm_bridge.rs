@@ -93,8 +93,8 @@ fn arm_before_proof(elf: &Elf, input_n: u32, vk_bytes: &[u8]) -> ArmPackage {
     OsRng.fill_bytes(&mut key_bytes);
     let key = <Sp1AadpField as AadpField>::from_u128(u128::from_le_bytes(key_bytes));
     let mut rng = StdRng::from_seed(encryption_seed);
-    let armed =
-        arm_germ_aadp_template(&capsule, key, &mut rng).expect("arm pre-proof GERM/AADP template");
+    let armed = arm_germ_aadp_template(&capsule, &residual_plan, key, &mut rng)
+        .expect("arm pre-proof GERM/AADP template");
 
     ArmPackage {
         public_values,
