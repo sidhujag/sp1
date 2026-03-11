@@ -12,7 +12,6 @@ use rand::RngCore;
 use sha2::{Digest, Sha256};
 use slop_algebra::{AbstractExtensionField, AbstractField, Field, PrimeField32};
 use sp1_primitives::{SP1ExtensionField, SP1Field};
-use std::collections::BTreeMap;
 
 use crate::aadp::{
     aadp_encrypt_scalar, AadpCiphertext, AadpConstraintSystem, AadpLinearForm, AadpMulConstraint,
@@ -88,18 +87,10 @@ pub struct GermAadpConstraintStats {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MultiplicativeTermField {
-    A,
-    B,
-    C,
-    D,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommitmentWitnessSlot {
     LinearCoefficient { term_idx: usize },
     LinearValue { term_idx: usize },
-    MultiplicativeField { term_idx: usize, field: MultiplicativeTermField },
+    MultiplicativeResidual { term_idx: usize },
 }
 
 #[derive(Debug, Clone)]
@@ -110,6 +101,7 @@ struct CommitmentBindingLayout {
     expected_mul_terms: usize,
     linear_coefficient_indices: Vec<Option<usize>>,
     linear_value_indices: Vec<usize>,
+    multiplicative_residual_indices: Vec<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -266,7 +258,7 @@ fn transcript_commitment_message(
     lin_terms: &[Sp1LinTerm],
     mul_terms: &[Sp1MulTerm],
 ) -> Vec<SP1ExtensionField> {
-    let mut out = Vec::with_capacity(2 + (lin_terms.len() * 2) + (mul_terms.len() * 4));
+    let mut out = Vec::with_capacity(2 + (lin_terms.len() * 2) + mul_terms.len());
     out.push(domain_tag_extension(b"sp1-germ/transcript/lin/v1"));
     for term in lin_terms {
         out.push(term.coefficient);
@@ -274,10 +266,7 @@ fn transcript_commitment_message(
     }
     out.push(domain_tag_extension(b"sp1-germ/transcript/mul/v1"));
     for term in mul_terms {
-        out.push(term.a);
-        out.push(term.b);
-        out.push(term.c);
-        out.push(term.d);
+        out.push((term.a * term.b) - (term.c * term.d));
     }
     out
 }
@@ -298,21 +287,19 @@ fn linear_descriptor_term_count(descriptor: &LinearResidualDescriptor) -> usize 
 }
 
 fn expected_mul_term_count(plan: &GermResidualPlan) -> Result<usize, GermError> {
-    let target = 1usize
-        .checked_shl(u32::from(plan.sumcheck_rounds))
-        .ok_or_else(|| {
-            GermError::InvalidResidualPlan(format!(
-                "sumcheck_rounds too large for usize shift: {}",
-                plan.sumcheck_rounds
-            ))
-        })?;
+    let target = 1usize.checked_shl(u32::from(plan.sumcheck_rounds)).ok_or_else(|| {
+        GermError::InvalidResidualPlan(format!(
+            "sumcheck_rounds too large for usize shift: {}",
+            plan.sumcheck_rounds
+        ))
+    })?;
     if plan.multiplicative_descriptors.len() > target {
         return Err(GermError::InvalidResidualPlan(format!(
             "descriptor prefix exceeds sumcheck capacity: descriptors={} capacity={target}",
             plan.multiplicative_descriptors.len()
         )));
     }
-    Ok(target)
+    Ok(plan.multiplicative_descriptors.len())
 }
 
 fn validate_residual_plan_for_template(
@@ -373,9 +360,9 @@ fn build_commitment_binding_layout(
         })
         .collect::<Vec<_>>();
     let mut commitment_slots = Vec::new();
-    let mut degree_bit_slots = BTreeMap::<(String, usize), usize>::new();
     let mut linear_coefficient_indices = Vec::new();
     let mut linear_value_indices = Vec::new();
+    let mut multiplicative_residual_indices = Vec::new();
     let mut column_idx = 0usize;
 
     add_commitment_message_affine_entry(
@@ -426,9 +413,8 @@ fn build_commitment_binding_layout(
             linear_value_indices.push(value_idx);
             match descriptor {
                 _ => {
-                    commitment_slots.push(CommitmentWitnessSlot::LinearValue {
-                        term_idx: linear_term_idx,
-                    });
+                    commitment_slots
+                        .push(CommitmentWitnessSlot::LinearValue { term_idx: linear_term_idx });
                     add_commitment_message_affine_entry(
                         forms.as_mut_slice(),
                         &seed,
@@ -454,313 +440,19 @@ fn build_commitment_binding_layout(
     );
     column_idx += 1;
 
-    let mut mul_term_idx = 0usize;
-    for descriptor in &residual_plan.multiplicative_descriptors {
-        match descriptor {
-            MultiplicativeResidualDescriptor::Explicit => {
-                for field in [
-                    MultiplicativeTermField::A,
-                    MultiplicativeTermField::B,
-                    MultiplicativeTermField::C,
-                    MultiplicativeTermField::D,
-                ] {
-                    let field_idx = alloc();
-                    commitment_slots.push(CommitmentWitnessSlot::MultiplicativeField {
-                        term_idx: mul_term_idx,
-                        field,
-                    });
-                    add_commitment_message_affine_entry(
-                        forms.as_mut_slice(),
-                        &seed,
-                        column_idx,
-                        Some(field_idx),
-                        ext_one(),
-                        ext_zero(),
-                    );
-                    column_idx += 1;
-                }
-            }
-            MultiplicativeResidualDescriptor::DegreeBitBooleanity { .. } => {
-                let (chip_name, bit_number) = match descriptor {
-                    MultiplicativeResidualDescriptor::DegreeBitBooleanity { chip_name, bit_idx } => {
-                        (chip_name.clone(), *bit_idx)
-                    }
-                    _ => unreachable!(),
-                };
-                let bit_idx = if let Some(existing_idx) =
-                    degree_bit_slots.get(&(chip_name.clone(), bit_number))
-                {
-                    *existing_idx
-                } else {
-                    let fresh_idx = alloc();
-                    commitment_slots.push(CommitmentWitnessSlot::MultiplicativeField {
-                        term_idx: mul_term_idx,
-                        field: MultiplicativeTermField::A,
-                    });
-                    degree_bit_slots.insert((chip_name, bit_number), fresh_idx);
-                    fresh_idx
-                };
-                add_commitment_message_affine_entry(
-                    forms.as_mut_slice(),
-                    &seed,
-                    column_idx,
-                    Some(bit_idx),
-                    ext_one(),
-                    ext_zero(),
-                );
-                column_idx += 1;
-                add_commitment_message_affine_entry(
-                    forms.as_mut_slice(),
-                    &seed,
-                    column_idx,
-                    Some(bit_idx),
-                    ext_one(),
-                    -ext_one(),
-                );
-                column_idx += 1;
-                add_commitment_message_affine_entry(
-                    forms.as_mut_slice(),
-                    &seed,
-                    column_idx,
-                    None,
-                    ext_zero(),
-                    ext_zero(),
-                );
-                column_idx += 1;
-                add_commitment_message_affine_entry(
-                    forms.as_mut_slice(),
-                    &seed,
-                    column_idx,
-                    None,
-                    ext_zero(),
-                    ext_one(),
-                );
-                column_idx += 1;
-            }
-            MultiplicativeResidualDescriptor::DegreeHeightProduct { .. } => {
-                let (chip_name, bit_number) = match descriptor {
-                    MultiplicativeResidualDescriptor::DegreeHeightProduct { chip_name, bit_idx } => {
-                        (chip_name.clone(), *bit_idx)
-                    }
-                    _ => unreachable!(),
-                };
-                let field_a_idx = if let Some(existing_idx) =
-                    degree_bit_slots.get(&(chip_name.clone(), bit_number))
-                {
-                    *existing_idx
-                } else {
-                    let fresh_idx = alloc();
-                    commitment_slots.push(CommitmentWitnessSlot::MultiplicativeField {
-                        term_idx: mul_term_idx,
-                        field: MultiplicativeTermField::A,
-                    });
-                    degree_bit_slots.insert((chip_name.clone(), bit_number), fresh_idx);
-                    fresh_idx
-                };
-                add_commitment_message_affine_entry(
-                    forms.as_mut_slice(),
-                    &seed,
-                    column_idx,
-                    Some(field_a_idx),
-                    ext_one(),
-                    ext_zero(),
-                );
-                column_idx += 1;
-                let field_b_idx =
-                    if let Some(existing_idx) = degree_bit_slots.get(&(chip_name.clone(), 0usize)) {
-                        *existing_idx
-                    } else {
-                        let fresh_idx = alloc();
-                        commitment_slots.push(CommitmentWitnessSlot::MultiplicativeField {
-                            term_idx: mul_term_idx,
-                            field: MultiplicativeTermField::B,
-                        });
-                        degree_bit_slots.insert((chip_name, 0usize), fresh_idx);
-                        fresh_idx
-                    };
-                add_commitment_message_affine_entry(
-                    forms.as_mut_slice(),
-                    &seed,
-                    column_idx,
-                    Some(field_b_idx),
-                    ext_one(),
-                    ext_zero(),
-                );
-                column_idx += 1;
-                add_commitment_message_affine_entry(
-                    forms.as_mut_slice(),
-                    &seed,
-                    column_idx,
-                    None,
-                    ext_zero(),
-                    ext_zero(),
-                );
-                column_idx += 1;
-                add_commitment_message_affine_entry(
-                    forms.as_mut_slice(),
-                    &seed,
-                    column_idx,
-                    None,
-                    ext_zero(),
-                    ext_one(),
-                );
-                column_idx += 1;
-            }
-            MultiplicativeResidualDescriptor::GkrPowWitness
-            | MultiplicativeResidualDescriptor::GkrCumulativeSum
-            | MultiplicativeResidualDescriptor::GkrRoundClaimedSum { .. }
-            | MultiplicativeResidualDescriptor::GkrTracePointCoord { .. }
-            | MultiplicativeResidualDescriptor::GkrFinalNumeratorEval
-            | MultiplicativeResidualDescriptor::GkrFinalDenominatorEval => {
-                let a_idx = alloc();
-                commitment_slots.push(CommitmentWitnessSlot::MultiplicativeField {
-                    term_idx: mul_term_idx,
-                    field: MultiplicativeTermField::A,
-                });
-                add_commitment_message_affine_entry(
-                    forms.as_mut_slice(),
-                    &seed,
-                    column_idx,
-                    Some(a_idx),
-                    ext_one(),
-                    ext_zero(),
-                );
-                column_idx += 1;
-                add_commitment_message_affine_entry(
-                    forms.as_mut_slice(),
-                    &seed,
-                    column_idx,
-                    None,
-                    ext_zero(),
-                    ext_one(),
-                );
-                column_idx += 1;
-                add_commitment_message_affine_entry(
-                    forms.as_mut_slice(),
-                    &seed,
-                    column_idx,
-                    None,
-                    ext_zero(),
-                    ext_zero(),
-                );
-                column_idx += 1;
-                add_commitment_message_affine_entry(
-                    forms.as_mut_slice(),
-                    &seed,
-                    column_idx,
-                    None,
-                    ext_zero(),
-                    ext_one(),
-                );
-                column_idx += 1;
-            }
-            MultiplicativeResidualDescriptor::GkrDenominatorInverse { .. } => {
-                for field in [MultiplicativeTermField::A, MultiplicativeTermField::B] {
-                    let field_idx = alloc();
-                    commitment_slots.push(CommitmentWitnessSlot::MultiplicativeField {
-                        term_idx: mul_term_idx,
-                        field,
-                    });
-                    add_commitment_message_affine_entry(
-                        forms.as_mut_slice(),
-                        &seed,
-                        column_idx,
-                        Some(field_idx),
-                        ext_one(),
-                        ext_zero(),
-                    );
-                    column_idx += 1;
-                }
-                add_commitment_message_affine_entry(
-                    forms.as_mut_slice(),
-                    &seed,
-                    column_idx,
-                    None,
-                    ext_zero(),
-                    ext_one(),
-                );
-                column_idx += 1;
-                add_commitment_message_affine_entry(
-                    forms.as_mut_slice(),
-                    &seed,
-                    column_idx,
-                    None,
-                    ext_zero(),
-                    ext_one(),
-                );
-                column_idx += 1;
-            }
-            MultiplicativeResidualDescriptor::GkrRoundFinalEval { .. } => {
-                for field in [
-                    MultiplicativeTermField::A,
-                    MultiplicativeTermField::B,
-                    MultiplicativeTermField::C,
-                ] {
-                    let field_idx = alloc();
-                    commitment_slots.push(CommitmentWitnessSlot::MultiplicativeField {
-                        term_idx: mul_term_idx,
-                        field,
-                    });
-                    add_commitment_message_affine_entry(
-                        forms.as_mut_slice(),
-                        &seed,
-                        column_idx,
-                        Some(field_idx),
-                        ext_one(),
-                        ext_zero(),
-                    );
-                    column_idx += 1;
-                }
-                add_commitment_message_affine_entry(
-                    forms.as_mut_slice(),
-                    &seed,
-                    column_idx,
-                    None,
-                    ext_zero(),
-                    ext_one(),
-                );
-                column_idx += 1;
-            }
-        }
-        mul_term_idx += 1;
-    }
-
     let expected_mul_terms = expected_mul_term_count(residual_plan)?;
-    for _ in mul_term_idx..expected_mul_terms {
+    for mul_term_idx in 0..expected_mul_terms {
+        let residual_idx = alloc();
+        multiplicative_residual_indices.push(residual_idx);
+        commitment_slots
+            .push(CommitmentWitnessSlot::MultiplicativeResidual { term_idx: mul_term_idx });
         add_commitment_message_affine_entry(
             forms.as_mut_slice(),
             &seed,
             column_idx,
-            None,
-            ext_zero(),
-            ext_zero(),
-        );
-        column_idx += 1;
-        add_commitment_message_affine_entry(
-            forms.as_mut_slice(),
-            &seed,
-            column_idx,
-            None,
-            ext_zero(),
+            Some(residual_idx),
             ext_one(),
-        );
-        column_idx += 1;
-        add_commitment_message_affine_entry(
-            forms.as_mut_slice(),
-            &seed,
-            column_idx,
-            None,
             ext_zero(),
-            ext_zero(),
-        );
-        column_idx += 1;
-        add_commitment_message_affine_entry(
-            forms.as_mut_slice(),
-            &seed,
-            column_idx,
-            None,
-            ext_zero(),
-            ext_one(),
         );
         column_idx += 1;
     }
@@ -772,6 +464,7 @@ fn build_commitment_binding_layout(
         expected_mul_terms,
         linear_coefficient_indices,
         linear_value_indices,
+        multiplicative_residual_indices,
     })
 }
 
@@ -781,34 +474,27 @@ fn slot_value_from_proof_object(
 ) -> Result<SP1ExtensionField, GermError> {
     match slot {
         CommitmentWitnessSlot::LinearCoefficient { term_idx } => {
-            proof_object
-                .lin_terms
-                .get(term_idx)
-                .map(|term| term.coefficient)
-                .ok_or(GermError::TranscriptShapeMismatch {
+            proof_object.lin_terms.get(term_idx).map(|term| term.coefficient).ok_or(
+                GermError::TranscriptShapeMismatch {
                     which: "linear commitment slot",
                     got: proof_object.lin_terms.len(),
                     expected: term_idx + 1,
-                })
+                },
+            )
         }
-        CommitmentWitnessSlot::LinearValue { term_idx } => proof_object
-            .lin_terms
-            .get(term_idx)
-            .map(|term| term.value)
-            .ok_or(GermError::TranscriptShapeMismatch {
-                which: "linear commitment slot",
-                got: proof_object.lin_terms.len(),
-                expected: term_idx + 1,
-            }),
-        CommitmentWitnessSlot::MultiplicativeField { term_idx, field } => proof_object
+        CommitmentWitnessSlot::LinearValue { term_idx } => {
+            proof_object.lin_terms.get(term_idx).map(|term| term.value).ok_or(
+                GermError::TranscriptShapeMismatch {
+                    which: "linear commitment slot",
+                    got: proof_object.lin_terms.len(),
+                    expected: term_idx + 1,
+                },
+            )
+        }
+        CommitmentWitnessSlot::MultiplicativeResidual { term_idx } => proof_object
             .mul_terms
             .get(term_idx)
-            .map(|term| match field {
-                MultiplicativeTermField::A => term.a,
-                MultiplicativeTermField::B => term.b,
-                MultiplicativeTermField::C => term.c,
-                MultiplicativeTermField::D => term.d,
-            })
+            .map(|term| (term.a * term.b) - (term.c * term.d))
             .ok_or(GermError::TranscriptShapeMismatch {
                 which: "multiplicative commitment slot",
                 got: proof_object.mul_terms.len(),
@@ -1165,110 +851,11 @@ pub fn compile_germ_aadp_template(
     );
     multiplication_gates += 4;
 
-    // r_mul = Challenge(theta, idx=1)
-    let (_r_mul_seed_sq_idx, r_mul_seed_state_idx) = add_absorb_constraints(
-        &mut constraints,
-        &mut alloc,
-        None,
-        bytes_to_extension(b"sp1-germ/r_mul/v2"),
-        Some(challenge_seed_idx),
-        ext_zero(),
-        12,
-    );
-    let (_r_mul_idx_sq_idx, r_mul_idx) = add_absorb_constraints(
-        &mut constraints,
-        &mut alloc,
-        Some(r_mul_seed_state_idx),
-        ext_zero(),
-        None,
-        ext_from_u32(1),
-        14,
-    );
-    multiplication_gates += 4;
-
-    // sumcheck_seed = left + (1+7) * right, where:
-    // left  = Challenge(".../mul-sumcheck-seed/v2", theta, [r_mul], 0)
-    // right = Challenge(".../mul-sumcheck-seed/v2", theta, [r_mul], 1)
-    let (_left_seed_sq_idx, left_seed_state_idx) = add_absorb_constraints(
-        &mut constraints,
-        &mut alloc,
-        None,
-        bytes_to_extension(b"sp1-germ/mul-sumcheck-seed/v2"),
-        Some(challenge_seed_idx),
-        ext_zero(),
-        11,
-    );
-    let (_left_idx_sq_idx, left_idx_state_idx) = add_absorb_constraints(
-        &mut constraints,
-        &mut alloc,
-        Some(left_seed_state_idx),
-        ext_zero(),
-        None,
-        ext_zero(),
-        13,
-    );
-    let (_left_extra_sq_idx, left_idx) = add_absorb_constraints(
-        &mut constraints,
-        &mut alloc,
-        Some(left_idx_state_idx),
-        ext_zero(),
-        Some(r_mul_idx),
-        ext_zero(),
-        17,
-    );
-    let (_right_seed_sq_idx, right_seed_state_idx) = add_absorb_constraints(
-        &mut constraints,
-        &mut alloc,
-        None,
-        bytes_to_extension(b"sp1-germ/mul-sumcheck-seed/v2"),
-        Some(challenge_seed_idx),
-        ext_zero(),
-        12,
-    );
-    let (_right_idx_sq_idx, right_idx_state_idx) = add_absorb_constraints(
-        &mut constraints,
-        &mut alloc,
-        Some(right_seed_state_idx),
-        ext_zero(),
-        None,
-        ext_from_u32(1),
-        14,
-    );
-    let (_right_extra_sq_idx, right_idx) = add_absorb_constraints(
-        &mut constraints,
-        &mut alloc,
-        Some(right_idx_state_idx),
-        ext_zero(),
-        Some(r_mul_idx),
-        ext_zero(),
-        18,
-    );
-    multiplication_gates += 12;
-    let sumcheck_seed_idx = alloc();
-    add_linear_zero_constraint(
-        &mut constraints,
-        AadpLinearForm {
-            constant: ext_zero(),
-            terms: vec![
-                (sumcheck_seed_idx, ext_one()),
-                (left_idx, -ext_one()),
-                (right_idx, -(ext_one() + ext_from_u32(7))),
-            ],
-        },
-    );
-    linear_round_checks += 1;
-
-    let inv2 = ext_from_u32(2).try_inverse().expect("2 must be invertible in SP1 extension field");
-    let inv6 = ext_from_u32(6).try_inverse().expect("6 must be invertible in SP1 extension field");
-
     // Exact in-boundary binding: `C = Com(T_pre)` over the compressed transcript basis.
     let binding_layout =
         build_commitment_binding_layout(&mut alloc, &commitment_coord_indices, residual_plan)?;
     for form in binding_layout.commitment_forms.iter().cloned() {
-        add_linear_zero_constraint(
-            &mut constraints,
-            form,
-        );
+        add_linear_zero_constraint(&mut constraints, form);
         opening_checks += 1;
     }
 
@@ -1371,8 +958,9 @@ pub fn compile_germ_aadp_template(
             lin_point_indices.push(lin_point_idx);
         }
 
-        let mut lin_table_forms =
-            Vec::<AadpLinearForm<SP1ExtensionField>>::with_capacity(binding_layout.expected_linear_terms.max(1).next_power_of_two());
+        let mut lin_table_forms = Vec::<AadpLinearForm<SP1ExtensionField>>::with_capacity(
+            binding_layout.expected_linear_terms.max(1).next_power_of_two(),
+        );
         for term_idx in 0..binding_layout.expected_linear_terms {
             let value_idx = binding_layout.linear_value_indices[term_idx];
             if let Some(coeff_idx) = binding_layout.linear_coefficient_indices[term_idx] {
@@ -1405,7 +993,8 @@ pub fn compile_germ_aadp_template(
                     delta_idx,
                 );
                 multiplication_gates += 1;
-                next_forms.push(linear_form_add_forms(&pair[0], &linear_form_single_var(delta_idx)));
+                next_forms
+                    .push(linear_form_add_forms(&pair[0], &linear_form_single_var(delta_idx)));
             }
             lin_table_forms = next_forms;
         }
@@ -1415,256 +1004,13 @@ pub fn compile_germ_aadp_template(
             linear_form_sub_forms(&linear_form_single_var(lin_claim_idx), &lin_table_forms[0]),
         );
         linear_round_checks += 1;
-        add_linear_zero_constraint(
-            &mut constraints,
-            linear_form_single_var(lin_claim_idx),
-        );
+        add_linear_zero_constraint(&mut constraints, linear_form_single_var(lin_claim_idx));
         linear_round_checks += 1;
     }
 
-    // Packed sumcheck verifier with schedule-fixed number of rounds.
-    let mut claimed_prev_idx: Option<usize> = None;
-    let mut round_challenge_indices = Vec::with_capacity(usize::from(capsule.sumcheck_rounds));
-    let round_domain = bytes_to_extension(b"sp1-germ/sumcheck-round-challenge/v2");
-    for round_idx in 0..usize::from(capsule.sumcheck_rounds) {
-        let eval_indices = [alloc(), alloc(), alloc(), alloc()];
-
-        let mut identity_terms = vec![(eval_indices[0], ext_one()), (eval_indices[1], ext_one())];
-        if let Some(prev_idx) = claimed_prev_idx {
-            identity_terms.push((prev_idx, -ext_one()));
-        }
-        add_linear_zero_constraint(
-            &mut constraints,
-            AadpLinearForm { constant: ext_zero(), terms: identity_terms },
-        );
-        linear_round_checks += 1;
-
-        // r_sc = Challenge(sumcheck_seed, idx=round_idx).
-        let (_r_sc_seed_sq_idx, r_sc_seed_state_idx) = add_absorb_constraints(
-            &mut constraints,
-            &mut alloc,
-            None,
-            round_domain,
-            Some(sumcheck_seed_idx),
-            ext_zero(),
-            (round_idx as u32).wrapping_add(11),
-        );
-        let (_r_sc_idx_sq_idx, r_sc_idx) = add_absorb_constraints(
-            &mut constraints,
-            &mut alloc,
-            Some(r_sc_seed_state_idx),
-            ext_zero(),
-            None,
-            ext_from_u32(round_idx as u32),
-            (round_idx as u32).wrapping_add(13),
-        );
-        multiplication_gates += 4;
-        round_challenge_indices.push(r_sc_idx);
-
-        // Newton/Horner interpolation at points 0,1,2,3:
-        // p(r)=e0 + r*(d1 + (r-1)*(c2 + (r-2)*c3))
-        // d1=e1-e0, c2=(e2-2e1+e0)/2, c3=(e3-3e2+3e1-e0)/6
-        let m_a_idx = alloc(); // (r-2)*c3
-        let m_b_idx = alloc(); // (c2 + m_a)*(r-1)
-        let m_c_idx = alloc(); // (d1 + m_b)*r
-        let claimed_next_idx = alloc();
-
-        add_mul_equals_var(
-            &mut constraints,
-            AadpLinearForm {
-                constant: ext_zero(),
-                terms: vec![
-                    (eval_indices[3], inv6),
-                    (eval_indices[2], -(inv6 + inv6 + inv6)),
-                    (eval_indices[1], inv6 + inv6 + inv6),
-                    (eval_indices[0], -inv6),
-                ],
-            },
-            AadpLinearForm { constant: -ext_from_u32(2), terms: vec![(r_sc_idx, ext_one())] },
-            m_a_idx,
-        );
-        add_mul_equals_var(
-            &mut constraints,
-            AadpLinearForm {
-                constant: ext_zero(),
-                terms: vec![
-                    (eval_indices[2], inv2),
-                    (eval_indices[1], -(inv2 + inv2)),
-                    (eval_indices[0], inv2),
-                    (m_a_idx, ext_one()),
-                ],
-            },
-            AadpLinearForm { constant: -ext_from_u32(1), terms: vec![(r_sc_idx, ext_one())] },
-            m_b_idx,
-        );
-        add_mul_equals_var(
-            &mut constraints,
-            AadpLinearForm {
-                constant: ext_zero(),
-                terms: vec![
-                    (eval_indices[1], ext_one()),
-                    (eval_indices[0], -ext_one()),
-                    (m_b_idx, ext_one()),
-                ],
-            },
-            linear_form_single_var(r_sc_idx),
-            m_c_idx,
-        );
-        multiplication_gates += 3;
-
-        add_linear_zero_constraint(
-            &mut constraints,
-            AadpLinearForm {
-                constant: ext_zero(),
-                terms: vec![
-                    (claimed_next_idx, ext_one()),
-                    (eval_indices[0], -ext_one()),
-                    (m_c_idx, -ext_one()),
-                ],
-            },
-        );
-        linear_round_checks += 1;
-        claimed_prev_idx = Some(claimed_next_idx);
-    }
-
-    let opening_a_idx = alloc();
-    let opening_b_idx = alloc();
-    let opening_c_idx = alloc();
-    let opening_d_idx = alloc();
-    let opening_lhs_product_idx = alloc();
-    let opening_rhs_product_idx = alloc();
-
-    constraints.push(AadpMulConstraint {
-        a: linear_form_single_var(opening_a_idx),
-        b: linear_form_single_var(opening_b_idx),
-        c: linear_form_constant(ext_one()),
-        d: linear_form_single_var(opening_lhs_product_idx),
-    });
-    constraints.push(AadpMulConstraint {
-        a: linear_form_single_var(opening_c_idx),
-        b: linear_form_single_var(opening_d_idx),
-        c: linear_form_constant(ext_one()),
-        d: linear_form_single_var(opening_rhs_product_idx),
-    });
-    multiplication_gates += 2;
-
-    if capsule.sumcheck_rounds == 0 {
-        add_linear_zero_constraint(
-            &mut constraints,
-            AadpLinearForm {
-                constant: ext_zero(),
-                terms: vec![
-                    (opening_lhs_product_idx, ext_one()),
-                    (opening_rhs_product_idx, -ext_one()),
-                ],
-            },
-        );
-        linear_round_checks += 1;
-    } else {
-        let mut point_indices = Vec::with_capacity(usize::from(capsule.sumcheck_rounds));
-        let mul_point_domain = bytes_to_extension(b"sp1-germ/mul-point/v1");
-        for var_idx in 0..usize::from(capsule.sumcheck_rounds) {
-            let (_point_seed_sq_idx, point_seed_state_idx) = add_absorb_constraints(
-                &mut constraints,
-                &mut alloc,
-                None,
-                mul_point_domain,
-                Some(sumcheck_seed_idx),
-                ext_zero(),
-                (var_idx as u32).wrapping_add(11),
-            );
-            let (_point_idx_sq_idx, point_idx) = add_absorb_constraints(
-                &mut constraints,
-                &mut alloc,
-                Some(point_seed_state_idx),
-                ext_zero(),
-                None,
-                ext_from_u32(var_idx as u32),
-                (var_idx as u32).wrapping_add(13),
-            );
-            multiplication_gates += 4;
-            point_indices.push(point_idx);
-        }
-
-        let mut eq_prev_idx: Option<usize> = None;
-        for (round_idx, (r_idx, s_idx)) in
-            point_indices.iter().zip(round_challenge_indices.iter()).enumerate()
-        {
-            let rs_idx = alloc(); // r*s
-            add_mul_equals_var(
-                &mut constraints,
-                linear_form_single_var(*r_idx),
-                linear_form_single_var(*s_idx),
-                rs_idx,
-            );
-            let factor_idx = alloc();
-            add_linear_zero_constraint(
-                &mut constraints,
-                AadpLinearForm {
-                    constant: -ext_one(),
-                    terms: vec![
-                        (factor_idx, ext_one()),
-                        (*r_idx, ext_one()),
-                        (*s_idx, ext_one()),
-                        (rs_idx, -(ext_from_u32(2))),
-                    ],
-                },
-            );
-            linear_round_checks += 1;
-
-            let eq_next_idx = alloc();
-            if round_idx == 0 {
-                add_linear_zero_constraint(
-                    &mut constraints,
-                    AadpLinearForm {
-                        constant: ext_zero(),
-                        terms: vec![(eq_next_idx, ext_one()), (factor_idx, -ext_one())],
-                    },
-                );
-                linear_round_checks += 1;
-            } else if let Some(prev_idx) = eq_prev_idx {
-                add_mul_equals_var(
-                    &mut constraints,
-                    linear_form_single_var(prev_idx),
-                    linear_form_single_var(factor_idx),
-                    eq_next_idx,
-                );
-                multiplication_gates += 1;
-            }
-            multiplication_gates += 1;
-            eq_prev_idx = Some(eq_next_idx);
-        }
-        let eq_eval_idx =
-            eq_prev_idx.expect("sumcheck rounds > 0 must allocate eq-eval accumulator");
-
-        let final_scaled_idx = alloc();
-        let delta_idx = alloc();
-        let claimed_last_idx = claimed_prev_idx.expect("sumcheck rounds > 0 must allocate claims");
-        add_linear_zero_constraint(
-            &mut constraints,
-            AadpLinearForm {
-                constant: ext_zero(),
-                terms: vec![
-                    (delta_idx, ext_one()),
-                    (opening_lhs_product_idx, -ext_one()),
-                    (opening_rhs_product_idx, ext_one()),
-                ],
-            },
-        );
-        constraints.push(AadpMulConstraint {
-            a: linear_form_single_var(eq_eval_idx),
-            b: linear_form_single_var(delta_idx),
-            c: linear_form_constant(ext_one()),
-            d: linear_form_single_var(final_scaled_idx),
-        });
-        multiplication_gates += 1;
-        add_linear_zero_constraint(
-            &mut constraints,
-            AadpLinearForm {
-                constant: ext_zero(),
-                terms: vec![(claimed_last_idx, ext_one()), (final_scaled_idx, -ext_one())],
-            },
-        );
+    // Multiplicative side: each descriptor contributes one committed residual scalar.
+    for residual_idx in &binding_layout.multiplicative_residual_indices {
+        add_linear_zero_constraint(&mut constraints, linear_form_single_var(*residual_idx));
         linear_round_checks += 1;
     }
 
@@ -1719,13 +1065,6 @@ pub fn materialize_transcript_bound_germ_aadp_witness(
 
     let proof_object = &transcript_bound.proof_object;
     let lin_proof = decode_lin_proof(&proof_object.pi_lin)?;
-    let mul_proof = decode_mul_sumcheck(&proof_object.pi_mul)?;
-    if usize::from(capsule.sumcheck_rounds) != mul_proof.rounds.len() {
-        return Err(GermError::SumcheckRoundsMismatch {
-            got: mul_proof.rounds.len(),
-            expected: usize::from(capsule.sumcheck_rounds),
-        });
-    }
     if proof_object.lin_terms.len() != template.layout.expected_linear_terms {
         return Err(GermError::TranscriptShapeMismatch {
             which: "linear terms",
@@ -1790,59 +1129,6 @@ pub fn materialize_transcript_bound_germ_aadp_witness(
     push(&mut witness, r_lin_absorb_idx_sq);
     push(&mut witness, r_lin_idx);
 
-    // r_mul trace
-    let r_mul_absorb_seed =
-        bytes_to_extension(b"sp1-germ/r_mul/v2") + challenge_seed + absorb_round_constant(12);
-    let r_mul_absorb_seed_sq = r_mul_absorb_seed * r_mul_absorb_seed;
-    let r_mul_seed_state = r_mul_absorb_seed_sq * (r_mul_absorb_seed + ext_one());
-    push(&mut witness, r_mul_absorb_seed_sq);
-    push(&mut witness, r_mul_seed_state);
-    let r_mul_absorb_idx = r_mul_seed_state + ext_from_u32(1) + absorb_round_constant(14);
-    let r_mul_absorb_idx_sq = r_mul_absorb_idx * r_mul_absorb_idx;
-    let r_mul_idx = r_mul_absorb_idx_sq * (r_mul_absorb_idx + ext_one());
-    push(&mut witness, r_mul_absorb_idx_sq);
-    push(&mut witness, r_mul_idx);
-
-    // sumcheck-seed trace
-    let left_seed_absorb = bytes_to_extension(b"sp1-germ/mul-sumcheck-seed/v2")
-        + challenge_seed
-        + absorb_round_constant(11);
-    let left_seed_absorb_sq = left_seed_absorb * left_seed_absorb;
-    let left_seed_state = left_seed_absorb_sq * (left_seed_absorb + ext_one());
-    push(&mut witness, left_seed_absorb_sq);
-    push(&mut witness, left_seed_state);
-    let left_idx_absorb = left_seed_state + ext_zero() + absorb_round_constant(13);
-    let left_idx_absorb_sq = left_idx_absorb * left_idx_absorb;
-    let left_idx_state = left_idx_absorb_sq * (left_idx_absorb + ext_one());
-    push(&mut witness, left_idx_absorb_sq);
-    push(&mut witness, left_idx_state);
-    let left_extra_absorb = left_idx_state + r_mul_idx + absorb_round_constant(17);
-    let left_extra_absorb_sq = left_extra_absorb * left_extra_absorb;
-    let left_idx = left_extra_absorb_sq * (left_extra_absorb + ext_one());
-    push(&mut witness, left_extra_absorb_sq);
-    push(&mut witness, left_idx);
-
-    let right_seed_absorb = bytes_to_extension(b"sp1-germ/mul-sumcheck-seed/v2")
-        + challenge_seed
-        + absorb_round_constant(12);
-    let right_seed_absorb_sq = right_seed_absorb * right_seed_absorb;
-    let right_seed_state = right_seed_absorb_sq * (right_seed_absorb + ext_one());
-    push(&mut witness, right_seed_absorb_sq);
-    push(&mut witness, right_seed_state);
-    let right_idx_absorb = right_seed_state + ext_from_u32(1) + absorb_round_constant(14);
-    let right_idx_absorb_sq = right_idx_absorb * right_idx_absorb;
-    let right_idx_state = right_idx_absorb_sq * (right_idx_absorb + ext_one());
-    push(&mut witness, right_idx_absorb_sq);
-    push(&mut witness, right_idx_state);
-    let right_extra_absorb = right_idx_state + r_mul_idx + absorb_round_constant(18);
-    let right_extra_absorb_sq = right_extra_absorb * right_extra_absorb;
-    let right_idx = right_extra_absorb_sq * (right_extra_absorb + ext_one());
-    push(&mut witness, right_extra_absorb_sq);
-    push(&mut witness, right_idx);
-
-    let sumcheck_seed = left_idx + (right_idx * (ext_one() + ext_from_u32(7)));
-    push(&mut witness, sumcheck_seed);
-
     for slot in &template.layout.commitment_slots {
         let slot_value = slot_value_from_proof_object(proof_object, *slot)?;
         push(&mut witness, slot_value);
@@ -1874,7 +1160,8 @@ pub fn materialize_transcript_bound_germ_aadp_witness(
         let lin_right_seed_state = lin_right_seed_absorb_sq * (lin_right_seed_absorb + ext_one());
         push(&mut witness, lin_right_seed_absorb_sq);
         push(&mut witness, lin_right_seed_state);
-        let lin_right_idx_absorb = lin_right_seed_state + ext_from_u32(3) + absorb_round_constant(16);
+        let lin_right_idx_absorb =
+            lin_right_seed_state + ext_from_u32(3) + absorb_round_constant(16);
         let lin_right_idx_absorb_sq = lin_right_idx_absorb * lin_right_idx_absorb;
         let lin_right_idx_state = lin_right_idx_absorb_sq * (lin_right_idx_absorb + ext_one());
         push(&mut witness, lin_right_idx_absorb_sq);
@@ -1895,7 +1182,8 @@ pub fn materialize_transcript_bound_germ_aadp_witness(
                 + lin_point_seed
                 + absorb_round_constant((var_idx as u32).wrapping_add(11));
             let lin_point_seed_absorb_sq = lin_point_seed_absorb * lin_point_seed_absorb;
-            let lin_point_seed_state = lin_point_seed_absorb_sq * (lin_point_seed_absorb + ext_one());
+            let lin_point_seed_state =
+                lin_point_seed_absorb_sq * (lin_point_seed_absorb + ext_one());
             push(&mut witness, lin_point_seed_absorb_sq);
             push(&mut witness, lin_point_seed_state);
             let lin_point_idx_absorb = lin_point_seed_state
@@ -1908,7 +1196,8 @@ pub fn materialize_transcript_bound_germ_aadp_witness(
             lin_point.push(lin_point_i);
         }
 
-        let mut lin_table = Vec::with_capacity(template.layout.expected_linear_terms.max(1).next_power_of_two());
+        let mut lin_table =
+            Vec::with_capacity(template.layout.expected_linear_terms.max(1).next_power_of_two());
         for term_idx in 0..template.layout.expected_linear_terms {
             let term = proof_object.lin_terms[term_idx];
             let product = term.coefficient * term.value;
@@ -1931,94 +1220,6 @@ pub fn materialize_transcript_bound_germ_aadp_witness(
             lin_table = next_table;
         }
         push(&mut witness, lin_proof.folded_residual);
-    }
-
-    let inv2 = ext_from_u32(2).try_inverse().expect("2 must be invertible in SP1 extension field");
-    let inv6 = ext_from_u32(6).try_inverse().expect("6 must be invertible in SP1 extension field");
-
-    let mut point = Vec::with_capacity(mul_proof.nvars as usize);
-    let mut sampled = Vec::with_capacity(mul_proof.rounds.len());
-    for (round_idx, round) in mul_proof.rounds.iter().enumerate() {
-        for eval in round.evaluations {
-            push(&mut witness, eval);
-        }
-
-        // r_sc derivation trace.
-        let r_sc_seed_absorb = bytes_to_extension(b"sp1-germ/sumcheck-round-challenge/v2")
-            + sumcheck_seed
-            + absorb_round_constant((round_idx as u32).wrapping_add(11));
-        let r_sc_seed_absorb_sq = r_sc_seed_absorb * r_sc_seed_absorb;
-        let r_sc_seed_state = r_sc_seed_absorb_sq * (r_sc_seed_absorb + ext_one());
-        push(&mut witness, r_sc_seed_absorb_sq);
-        push(&mut witness, r_sc_seed_state);
-        let r_sc_idx_absorb = r_sc_seed_state
-            + ext_from_u32(round_idx as u32)
-            + absorb_round_constant((round_idx as u32).wrapping_add(13));
-        let r_sc_idx_absorb_sq = r_sc_idx_absorb * r_sc_idx_absorb;
-        let r_sc = r_sc_idx_absorb_sq * (r_sc_idx_absorb + ext_one());
-        push(&mut witness, r_sc_idx_absorb_sq);
-        push(&mut witness, r_sc);
-
-        sampled.push(r_sc);
-
-        let e = round.evaluations;
-        let c3 = (e[3] - (ext_from_u32(3) * e[2]) + (ext_from_u32(3) * e[1]) - e[0]) * inv6;
-        let c2 = (e[2] - (ext_from_u32(2) * e[1]) + e[0]) * inv2;
-        let d1 = e[1] - e[0];
-        let m_a = (r_sc - ext_from_u32(2)) * c3;
-        let m_b = (c2 + m_a) * (r_sc - ext_from_u32(1));
-        let m_c = (d1 + m_b) * r_sc;
-        push(&mut witness, m_a);
-        push(&mut witness, m_b);
-        push(&mut witness, m_c);
-
-        let claimed_next = e[0] + m_c;
-        push(&mut witness, claimed_next);
-    }
-
-    push(&mut witness, mul_proof.opening.a);
-    push(&mut witness, mul_proof.opening.b);
-    push(&mut witness, mul_proof.opening.c);
-    push(&mut witness, mul_proof.opening.d);
-    let opening_lhs_product = mul_proof.opening.a * mul_proof.opening.b;
-    let opening_rhs_product = mul_proof.opening.c * mul_proof.opening.d;
-    push(&mut witness, opening_lhs_product);
-    push(&mut witness, opening_rhs_product);
-    let delta = opening_lhs_product - opening_rhs_product;
-    if capsule.sumcheck_rounds > 0 {
-        for var_idx in 0..usize::from(capsule.sumcheck_rounds) {
-            let point_seed_absorb = bytes_to_extension(b"sp1-germ/mul-point/v1")
-                + sumcheck_seed
-                + absorb_round_constant((var_idx as u32).wrapping_add(11));
-            let point_seed_absorb_sq = point_seed_absorb * point_seed_absorb;
-            let point_seed_state = point_seed_absorb_sq * (point_seed_absorb + ext_one());
-            push(&mut witness, point_seed_absorb_sq);
-            push(&mut witness, point_seed_state);
-            let point_idx_absorb = point_seed_state
-                + ext_from_u32(var_idx as u32)
-                + absorb_round_constant((var_idx as u32).wrapping_add(13));
-            let point_idx_absorb_sq = point_idx_absorb * point_idx_absorb;
-            let point_i = point_idx_absorb_sq * (point_idx_absorb + ext_one());
-            push(&mut witness, point_idx_absorb_sq);
-            push(&mut witness, point_i);
-            point.push(point_i);
-        }
-
-        let mut eq_eval = ext_zero();
-        for (round_idx, (r_i, s_i)) in point.iter().zip(sampled.iter()).enumerate() {
-            let rs = *r_i * *s_i;
-            let factor = ext_one() - *r_i - *s_i + (ext_from_u32(2) * rs);
-            if round_idx == 0 {
-                eq_eval = factor;
-            } else {
-                eq_eval *= factor;
-            }
-            push(&mut witness, rs);
-            push(&mut witness, factor);
-            push(&mut witness, eq_eval);
-        }
-        push(&mut witness, eq_eval * delta);
-        push(&mut witness, delta);
     }
 
     if witness.len() != template.cs.num_variables {
@@ -2910,12 +2111,9 @@ mod tests {
         let template = compile_germ_aadp_template(&capsule, &residual_plan)
             .expect("aadp template compile should succeed");
         let transcript_bound = TranscriptBoundSp1GermProofObject::new(bundle, commitment_root);
-        let witness = materialize_transcript_bound_germ_aadp_witness(
-            &template,
-            &capsule,
-            &transcript_bound,
-        )
-        .expect("materialize witness should succeed");
+        let witness =
+            materialize_transcript_bound_germ_aadp_witness(&template, &capsule, &transcript_bound)
+                .expect("materialize witness should succeed");
 
         assert!(
             template.stats.linear_round_checks >= 3,

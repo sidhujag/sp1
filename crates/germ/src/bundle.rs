@@ -3,8 +3,7 @@ use sha2::Digest;
 use slop_algebra::{AbstractExtensionField, AbstractField};
 use sp1_primitives::{SP1ExtensionField, SP1Field};
 
-pub type Sp1PackageCommitment =
-    [[SP1ExtensionField; PACKAGE_AJTAI_RING_DIM]; PACKAGE_AJTAI_ROWS];
+pub type Sp1PackageCommitment = [[SP1ExtensionField; PACKAGE_AJTAI_RING_DIM]; PACKAGE_AJTAI_ROWS];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum GermVerifierStage {
