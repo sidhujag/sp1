@@ -103,11 +103,22 @@ enum CommitmentWitnessSlot {
 }
 
 #[derive(Debug, Clone)]
+struct CommitmentBindingLayout {
+    commitment_slots: Vec<CommitmentWitnessSlot>,
+    commitment_forms: Vec<AadpLinearForm<SP1ExtensionField>>,
+    expected_linear_terms: usize,
+    expected_mul_terms: usize,
+    linear_coefficient_indices: Vec<Option<usize>>,
+    linear_value_indices: Vec<usize>,
+}
+
+#[derive(Debug, Clone)]
 pub struct GermAadpWitnessLayout {
     pub sumcheck_rounds: usize,
     expected_linear_terms: usize,
     expected_mul_terms: usize,
     commitment_slots: Vec<CommitmentWitnessSlot>,
+    linear_term_has_explicit_coefficient: Vec<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -352,8 +363,7 @@ fn build_commitment_binding_layout(
     alloc: &mut impl FnMut() -> usize,
     commitment_coord_indices: &[usize; PACKAGE_AJTAI_ROWS * PACKAGE_AJTAI_RING_DIM],
     residual_plan: &GermResidualPlan,
-) -> Result<(Vec<CommitmentWitnessSlot>, Vec<AadpLinearForm<SP1ExtensionField>>, usize, usize), GermError>
-{
+) -> Result<CommitmentBindingLayout, GermError> {
     let seed = derive_package_ajtai_seed();
     let mut forms = commitment_coord_indices
         .iter()
@@ -364,6 +374,8 @@ fn build_commitment_binding_layout(
         .collect::<Vec<_>>();
     let mut commitment_slots = Vec::new();
     let mut degree_bit_slots = BTreeMap::<(String, usize), usize>::new();
+    let mut linear_coefficient_indices = Vec::new();
+    let mut linear_value_indices = Vec::new();
     let mut column_idx = 0usize;
 
     add_commitment_message_affine_entry(
@@ -379,7 +391,7 @@ fn build_commitment_binding_layout(
     let mut linear_term_idx = 0usize;
     for descriptor in &residual_plan.linear_descriptors {
         for _ in 0..linear_descriptor_term_count(descriptor) {
-            match descriptor {
+            let coeff_var_idx = match descriptor {
                 LinearResidualDescriptor::Explicit => {
                     let coeff_idx = alloc();
                     commitment_slots.push(CommitmentWitnessSlot::LinearCoefficient {
@@ -393,6 +405,7 @@ fn build_commitment_binding_layout(
                         ext_one(),
                         ext_zero(),
                     );
+                    Some(coeff_idx)
                 }
                 _ => {
                     add_commitment_message_affine_entry(
@@ -403,22 +416,29 @@ fn build_commitment_binding_layout(
                         ext_zero(),
                         ext_one(),
                     );
+                    None
                 }
-            }
+            };
+            linear_coefficient_indices.push(coeff_var_idx);
             column_idx += 1;
 
             let value_idx = alloc();
-            commitment_slots.push(CommitmentWitnessSlot::LinearValue {
-                term_idx: linear_term_idx,
-            });
-            add_commitment_message_affine_entry(
-                forms.as_mut_slice(),
-                &seed,
-                column_idx,
-                Some(value_idx),
-                ext_one(),
-                ext_zero(),
-            );
+            linear_value_indices.push(value_idx);
+            match descriptor {
+                _ => {
+                    commitment_slots.push(CommitmentWitnessSlot::LinearValue {
+                        term_idx: linear_term_idx,
+                    });
+                    add_commitment_message_affine_entry(
+                        forms.as_mut_slice(),
+                        &seed,
+                        column_idx,
+                        Some(value_idx),
+                        ext_one(),
+                        ext_zero(),
+                    );
+                }
+            }
             column_idx += 1;
             linear_term_idx += 1;
         }
@@ -745,7 +765,14 @@ fn build_commitment_binding_layout(
         column_idx += 1;
     }
 
-    Ok((commitment_slots, forms, linear_term_idx, expected_mul_terms))
+    Ok(CommitmentBindingLayout {
+        commitment_slots,
+        commitment_forms: forms,
+        expected_linear_terms: linear_term_idx,
+        expected_mul_terms,
+        linear_coefficient_indices,
+        linear_value_indices,
+    })
 }
 
 fn slot_value_from_proof_object(
@@ -1117,6 +1144,27 @@ pub fn compile_germ_aadp_template(
     );
     multiplication_gates += 2;
 
+    // r_lin = Challenge(theta, idx=0)
+    let (_r_lin_seed_sq_idx, r_lin_seed_state_idx) = add_absorb_constraints(
+        &mut constraints,
+        &mut alloc,
+        None,
+        bytes_to_extension(b"sp1-germ/r_lin/v2"),
+        Some(challenge_seed_idx),
+        ext_zero(),
+        11,
+    );
+    let (_r_lin_idx_sq_idx, r_lin_idx) = add_absorb_constraints(
+        &mut constraints,
+        &mut alloc,
+        Some(r_lin_seed_state_idx),
+        ext_zero(),
+        None,
+        ext_zero(),
+        13,
+    );
+    multiplication_gates += 4;
+
     // r_mul = Challenge(theta, idx=1)
     let (_r_mul_seed_sq_idx, r_mul_seed_state_idx) = add_absorb_constraints(
         &mut constraints,
@@ -1214,14 +1262,164 @@ pub fn compile_germ_aadp_template(
     let inv6 = ext_from_u32(6).try_inverse().expect("6 must be invertible in SP1 extension field");
 
     // Exact in-boundary binding: `C = Com(T_pre)` over the compressed transcript basis.
-    let (commitment_slots, commitment_forms, expected_linear_terms, expected_mul_terms) =
+    let binding_layout =
         build_commitment_binding_layout(&mut alloc, &commitment_coord_indices, residual_plan)?;
-    for form in commitment_forms {
+    for form in binding_layout.commitment_forms.iter().cloned() {
         add_linear_zero_constraint(
             &mut constraints,
             form,
         );
         opening_checks += 1;
+    }
+
+    if binding_layout.expected_linear_terms > 0 {
+        // lin_point_seed = left + (1+7) * right, where:
+        // left  = Challenge(".../lin-point-seed/v2", theta, [r_lin], 2)
+        // right = Challenge(".../lin-point-seed/v2", theta, [r_lin], 3)
+        let (_lin_left_seed_sq_idx, lin_left_seed_state_idx) = add_absorb_constraints(
+            &mut constraints,
+            &mut alloc,
+            None,
+            bytes_to_extension(b"sp1-germ/lin-point-seed/v2"),
+            Some(challenge_seed_idx),
+            ext_zero(),
+            13,
+        );
+        let (_lin_left_idx_sq_idx, lin_left_idx_state_idx) = add_absorb_constraints(
+            &mut constraints,
+            &mut alloc,
+            Some(lin_left_seed_state_idx),
+            ext_zero(),
+            None,
+            ext_from_u32(2),
+            15,
+        );
+        let (_lin_left_extra_sq_idx, lin_left_idx) = add_absorb_constraints(
+            &mut constraints,
+            &mut alloc,
+            Some(lin_left_idx_state_idx),
+            ext_zero(),
+            Some(r_lin_idx),
+            ext_zero(),
+            19,
+        );
+        let (_lin_right_seed_sq_idx, lin_right_seed_state_idx) = add_absorb_constraints(
+            &mut constraints,
+            &mut alloc,
+            None,
+            bytes_to_extension(b"sp1-germ/lin-point-seed/v2"),
+            Some(challenge_seed_idx),
+            ext_zero(),
+            14,
+        );
+        let (_lin_right_idx_sq_idx, lin_right_idx_state_idx) = add_absorb_constraints(
+            &mut constraints,
+            &mut alloc,
+            Some(lin_right_seed_state_idx),
+            ext_zero(),
+            None,
+            ext_from_u32(3),
+            16,
+        );
+        let (_lin_right_extra_sq_idx, lin_right_idx) = add_absorb_constraints(
+            &mut constraints,
+            &mut alloc,
+            Some(lin_right_idx_state_idx),
+            ext_zero(),
+            Some(r_lin_idx),
+            ext_zero(),
+            20,
+        );
+        multiplication_gates += 12;
+        let lin_point_seed_idx = alloc();
+        add_linear_zero_constraint(
+            &mut constraints,
+            AadpLinearForm {
+                constant: ext_zero(),
+                terms: vec![
+                    (lin_point_seed_idx, ext_one()),
+                    (lin_left_idx, -ext_one()),
+                    (lin_right_idx, -(ext_one() + ext_from_u32(7))),
+                ],
+            },
+        );
+        linear_round_checks += 1;
+
+        let lin_nvars = mul_sumcheck_nvars(binding_layout.expected_linear_terms);
+        let lin_point_domain = bytes_to_extension(b"sp1-germ/lin-point/v1");
+        let mut lin_point_indices = Vec::with_capacity(lin_nvars);
+        for var_idx in 0..lin_nvars {
+            let (_lin_point_seed_sq_idx, lin_point_seed_state_idx) = add_absorb_constraints(
+                &mut constraints,
+                &mut alloc,
+                None,
+                lin_point_domain,
+                Some(lin_point_seed_idx),
+                ext_zero(),
+                (var_idx as u32).wrapping_add(11),
+            );
+            let (_lin_point_idx_sq_idx, lin_point_idx) = add_absorb_constraints(
+                &mut constraints,
+                &mut alloc,
+                Some(lin_point_seed_state_idx),
+                ext_zero(),
+                None,
+                ext_from_u32(var_idx as u32),
+                (var_idx as u32).wrapping_add(13),
+            );
+            multiplication_gates += 4;
+            lin_point_indices.push(lin_point_idx);
+        }
+
+        let mut lin_table_forms =
+            Vec::<AadpLinearForm<SP1ExtensionField>>::with_capacity(binding_layout.expected_linear_terms.max(1).next_power_of_two());
+        for term_idx in 0..binding_layout.expected_linear_terms {
+            let value_idx = binding_layout.linear_value_indices[term_idx];
+            if let Some(coeff_idx) = binding_layout.linear_coefficient_indices[term_idx] {
+                let product_idx = alloc();
+                add_mul_equals_var(
+                    &mut constraints,
+                    linear_form_single_var(coeff_idx),
+                    linear_form_single_var(value_idx),
+                    product_idx,
+                );
+                multiplication_gates += 1;
+                lin_table_forms.push(linear_form_single_var(product_idx));
+            } else {
+                lin_table_forms.push(linear_form_single_var(value_idx));
+            }
+        }
+        let padded_linear_terms = binding_layout.expected_linear_terms.max(1).next_power_of_two();
+        while lin_table_forms.len() < padded_linear_terms {
+            lin_table_forms.push(linear_form_constant(ext_zero()));
+        }
+        for r_idx in lin_point_indices {
+            let mut next_forms =
+                Vec::<AadpLinearForm<SP1ExtensionField>>::with_capacity(lin_table_forms.len() / 2);
+            for pair in lin_table_forms.chunks_exact(2) {
+                let delta_idx = alloc();
+                add_mul_equals_var(
+                    &mut constraints,
+                    linear_form_sub_forms(&pair[1], &pair[0]),
+                    linear_form_single_var(r_idx),
+                    delta_idx,
+                );
+                multiplication_gates += 1;
+                next_forms.push(linear_form_add_forms(&pair[0], &linear_form_single_var(delta_idx)));
+            }
+            lin_table_forms = next_forms;
+        }
+        let lin_claim_idx = alloc();
+        add_linear_zero_constraint(
+            &mut constraints,
+            linear_form_sub_forms(&linear_form_single_var(lin_claim_idx), &lin_table_forms[0]),
+        );
+        linear_round_checks += 1;
+        add_linear_zero_constraint(
+            &mut constraints,
+            linear_form_single_var(lin_claim_idx),
+        );
+        linear_round_checks += 1;
     }
 
     // Packed sumcheck verifier with schedule-fixed number of rounds.
@@ -1474,9 +1672,14 @@ pub fn compile_germ_aadp_template(
         cs: AadpConstraintSystem { num_variables, constraints },
         layout: GermAadpWitnessLayout {
             sumcheck_rounds: usize::from(capsule.sumcheck_rounds),
-            expected_linear_terms,
-            expected_mul_terms,
-            commitment_slots,
+            expected_linear_terms: binding_layout.expected_linear_terms,
+            expected_mul_terms: binding_layout.expected_mul_terms,
+            commitment_slots: binding_layout.commitment_slots,
+            linear_term_has_explicit_coefficient: binding_layout
+                .linear_coefficient_indices
+                .iter()
+                .map(|idx| idx.is_some())
+                .collect(),
         },
         stats: GermAadpConstraintStats {
             linear_round_checks,
@@ -1515,6 +1718,7 @@ pub fn materialize_transcript_bound_germ_aadp_witness(
     verify_transcript_bound_sp1_germ_proof_object(transcript_bound, capsule)?;
 
     let proof_object = &transcript_bound.proof_object;
+    let lin_proof = decode_lin_proof(&proof_object.pi_lin)?;
     let mul_proof = decode_mul_sumcheck(&proof_object.pi_mul)?;
     if usize::from(capsule.sumcheck_rounds) != mul_proof.rounds.len() {
         return Err(GermError::SumcheckRoundsMismatch {
@@ -1582,61 +1786,9 @@ pub fn materialize_transcript_bound_germ_aadp_witness(
     push(&mut witness, r_lin_seed_state);
     let r_lin_absorb_idx = r_lin_seed_state + ext_zero() + absorb_round_constant(13);
     let r_lin_absorb_idx_sq = r_lin_absorb_idx * r_lin_absorb_idx;
-    let _r_lin_idx = r_lin_absorb_idx_sq * (r_lin_absorb_idx + ext_one());
+    let r_lin_idx = r_lin_absorb_idx_sq * (r_lin_absorb_idx + ext_one());
     push(&mut witness, r_lin_absorb_idx_sq);
-    push(&mut witness, _r_lin_idx);
-
-    // r_lin trace
-    let r_lin_absorb_seed =
-        bytes_to_extension(b"sp1-germ/r_lin/v2") + challenge_seed + absorb_round_constant(11);
-    let r_lin_absorb_seed_sq = r_lin_absorb_seed * r_lin_absorb_seed;
-    let r_lin_seed_state = r_lin_absorb_seed_sq * (r_lin_absorb_seed + ext_one());
-    push(&mut witness, r_lin_absorb_seed_sq);
-    push(&mut witness, r_lin_seed_state);
-    let r_lin_absorb_idx = r_lin_seed_state + ext_zero() + absorb_round_constant(13);
-    let r_lin_absorb_idx_sq = r_lin_absorb_idx * r_lin_absorb_idx;
-    let _r_lin_idx = r_lin_absorb_idx_sq * (r_lin_absorb_idx + ext_one());
-    push(&mut witness, r_lin_absorb_idx_sq);
-    push(&mut witness, _r_lin_idx);
-
-    // r_lin trace
-    let r_lin_absorb_seed =
-        bytes_to_extension(b"sp1-germ/r_lin/v2") + challenge_seed + absorb_round_constant(11);
-    let r_lin_absorb_seed_sq = r_lin_absorb_seed * r_lin_absorb_seed;
-    let r_lin_seed_state = r_lin_absorb_seed_sq * (r_lin_absorb_seed + ext_one());
-    push(&mut witness, r_lin_absorb_seed_sq);
-    push(&mut witness, r_lin_seed_state);
-    let r_lin_absorb_idx = r_lin_seed_state + ext_zero() + absorb_round_constant(13);
-    let r_lin_absorb_idx_sq = r_lin_absorb_idx * r_lin_absorb_idx;
-    let _r_lin_idx = r_lin_absorb_idx_sq * (r_lin_absorb_idx + ext_one());
-    push(&mut witness, r_lin_absorb_idx_sq);
-    push(&mut witness, _r_lin_idx);
-
-    // r_lin trace
-    let r_lin_absorb_seed =
-        bytes_to_extension(b"sp1-germ/r_lin/v2") + challenge_seed + absorb_round_constant(11);
-    let r_lin_absorb_seed_sq = r_lin_absorb_seed * r_lin_absorb_seed;
-    let r_lin_seed_state = r_lin_absorb_seed_sq * (r_lin_absorb_seed + ext_one());
-    push(&mut witness, r_lin_absorb_seed_sq);
-    push(&mut witness, r_lin_seed_state);
-    let r_lin_absorb_idx = r_lin_seed_state + ext_zero() + absorb_round_constant(13);
-    let r_lin_absorb_idx_sq = r_lin_absorb_idx * r_lin_absorb_idx;
-    let _r_lin_idx = r_lin_absorb_idx_sq * (r_lin_absorb_idx + ext_one());
-    push(&mut witness, r_lin_absorb_idx_sq);
-    push(&mut witness, _r_lin_idx);
-
-    // r_lin trace
-    let r_lin_absorb_seed =
-        bytes_to_extension(b"sp1-germ/r_lin/v2") + challenge_seed + absorb_round_constant(11);
-    let r_lin_absorb_seed_sq = r_lin_absorb_seed * r_lin_absorb_seed;
-    let r_lin_seed_state = r_lin_absorb_seed_sq * (r_lin_absorb_seed + ext_one());
-    push(&mut witness, r_lin_absorb_seed_sq);
-    push(&mut witness, r_lin_seed_state);
-    let r_lin_absorb_idx = r_lin_seed_state + ext_zero() + absorb_round_constant(13);
-    let r_lin_absorb_idx_sq = r_lin_absorb_idx * r_lin_absorb_idx;
-    let _r_lin_idx = r_lin_absorb_idx_sq * (r_lin_absorb_idx + ext_one());
-    push(&mut witness, r_lin_absorb_idx_sq);
-    push(&mut witness, _r_lin_idx);
+    push(&mut witness, r_lin_idx);
 
     // r_mul trace
     let r_mul_absorb_seed =
@@ -1691,12 +1843,96 @@ pub fn materialize_transcript_bound_germ_aadp_witness(
     let sumcheck_seed = left_idx + (right_idx * (ext_one() + ext_from_u32(7)));
     push(&mut witness, sumcheck_seed);
 
-    push(&mut witness, lin_proof.folded_residual);
-
     for slot in &template.layout.commitment_slots {
         let slot_value = slot_value_from_proof_object(proof_object, *slot)?;
         push(&mut witness, slot_value);
     }
+
+    if template.layout.expected_linear_terms > 0 {
+        let lin_left_seed_absorb = bytes_to_extension(b"sp1-germ/lin-point-seed/v2")
+            + challenge_seed
+            + absorb_round_constant(13);
+        let lin_left_seed_absorb_sq = lin_left_seed_absorb * lin_left_seed_absorb;
+        let lin_left_seed_state = lin_left_seed_absorb_sq * (lin_left_seed_absorb + ext_one());
+        push(&mut witness, lin_left_seed_absorb_sq);
+        push(&mut witness, lin_left_seed_state);
+        let lin_left_idx_absorb = lin_left_seed_state + ext_from_u32(2) + absorb_round_constant(15);
+        let lin_left_idx_absorb_sq = lin_left_idx_absorb * lin_left_idx_absorb;
+        let lin_left_idx_state = lin_left_idx_absorb_sq * (lin_left_idx_absorb + ext_one());
+        push(&mut witness, lin_left_idx_absorb_sq);
+        push(&mut witness, lin_left_idx_state);
+        let lin_left_extra_absorb = lin_left_idx_state + r_lin_idx + absorb_round_constant(19);
+        let lin_left_extra_absorb_sq = lin_left_extra_absorb * lin_left_extra_absorb;
+        let lin_left_idx = lin_left_extra_absorb_sq * (lin_left_extra_absorb + ext_one());
+        push(&mut witness, lin_left_extra_absorb_sq);
+        push(&mut witness, lin_left_idx);
+
+        let lin_right_seed_absorb = bytes_to_extension(b"sp1-germ/lin-point-seed/v2")
+            + challenge_seed
+            + absorb_round_constant(14);
+        let lin_right_seed_absorb_sq = lin_right_seed_absorb * lin_right_seed_absorb;
+        let lin_right_seed_state = lin_right_seed_absorb_sq * (lin_right_seed_absorb + ext_one());
+        push(&mut witness, lin_right_seed_absorb_sq);
+        push(&mut witness, lin_right_seed_state);
+        let lin_right_idx_absorb = lin_right_seed_state + ext_from_u32(3) + absorb_round_constant(16);
+        let lin_right_idx_absorb_sq = lin_right_idx_absorb * lin_right_idx_absorb;
+        let lin_right_idx_state = lin_right_idx_absorb_sq * (lin_right_idx_absorb + ext_one());
+        push(&mut witness, lin_right_idx_absorb_sq);
+        push(&mut witness, lin_right_idx_state);
+        let lin_right_extra_absorb = lin_right_idx_state + r_lin_idx + absorb_round_constant(20);
+        let lin_right_extra_absorb_sq = lin_right_extra_absorb * lin_right_extra_absorb;
+        let lin_right_idx = lin_right_extra_absorb_sq * (lin_right_extra_absorb + ext_one());
+        push(&mut witness, lin_right_extra_absorb_sq);
+        push(&mut witness, lin_right_idx);
+
+        let lin_point_seed = lin_left_idx + (lin_right_idx * (ext_one() + ext_from_u32(7)));
+        push(&mut witness, lin_point_seed);
+
+        let lin_nvars = mul_sumcheck_nvars(template.layout.expected_linear_terms);
+        let mut lin_point = Vec::with_capacity(lin_nvars);
+        for var_idx in 0..lin_nvars {
+            let lin_point_seed_absorb = bytes_to_extension(b"sp1-germ/lin-point/v1")
+                + lin_point_seed
+                + absorb_round_constant((var_idx as u32).wrapping_add(11));
+            let lin_point_seed_absorb_sq = lin_point_seed_absorb * lin_point_seed_absorb;
+            let lin_point_seed_state = lin_point_seed_absorb_sq * (lin_point_seed_absorb + ext_one());
+            push(&mut witness, lin_point_seed_absorb_sq);
+            push(&mut witness, lin_point_seed_state);
+            let lin_point_idx_absorb = lin_point_seed_state
+                + ext_from_u32(var_idx as u32)
+                + absorb_round_constant((var_idx as u32).wrapping_add(13));
+            let lin_point_idx_absorb_sq = lin_point_idx_absorb * lin_point_idx_absorb;
+            let lin_point_i = lin_point_idx_absorb_sq * (lin_point_idx_absorb + ext_one());
+            push(&mut witness, lin_point_idx_absorb_sq);
+            push(&mut witness, lin_point_i);
+            lin_point.push(lin_point_i);
+        }
+
+        let mut lin_table = Vec::with_capacity(template.layout.expected_linear_terms.max(1).next_power_of_two());
+        for term_idx in 0..template.layout.expected_linear_terms {
+            let term = proof_object.lin_terms[term_idx];
+            let product = term.coefficient * term.value;
+            if template.layout.linear_term_has_explicit_coefficient[term_idx] {
+                push(&mut witness, product);
+            }
+            lin_table.push(product);
+        }
+        let padded_linear_terms = template.layout.expected_linear_terms.max(1).next_power_of_two();
+        while lin_table.len() < padded_linear_terms {
+            lin_table.push(ext_zero());
+        }
+        for r_i in &lin_point {
+            let mut next_table = Vec::with_capacity(lin_table.len() / 2);
+            for pair in lin_table.chunks_exact(2) {
+                let delta = (pair[1] - pair[0]) * *r_i;
+                push(&mut witness, delta);
+                next_table.push(pair[0] + delta);
+            }
+            lin_table = next_table;
+        }
+        push(&mut witness, lin_proof.folded_residual);
+    }
+
     let inv2 = ext_from_u32(2).try_inverse().expect("2 must be invertible in SP1 extension field");
     let inv6 = ext_from_u32(6).try_inverse().expect("6 must be invertible in SP1 extension field");
 
@@ -2027,6 +2263,24 @@ fn linear_form_constant(value: SP1ExtensionField) -> AadpLinearForm<SP1Extension
 
 fn linear_form_single_var(var_idx: usize) -> AadpLinearForm<SP1ExtensionField> {
     AadpLinearForm { constant: ext_zero(), terms: vec![(var_idx, ext_one())] }
+}
+
+fn linear_form_add_forms(
+    lhs: &AadpLinearForm<SP1ExtensionField>,
+    rhs: &AadpLinearForm<SP1ExtensionField>,
+) -> AadpLinearForm<SP1ExtensionField> {
+    let mut terms = lhs.terms.clone();
+    terms.extend(rhs.terms.iter().copied());
+    AadpLinearForm { constant: lhs.constant + rhs.constant, terms }
+}
+
+fn linear_form_sub_forms(
+    lhs: &AadpLinearForm<SP1ExtensionField>,
+    rhs: &AadpLinearForm<SP1ExtensionField>,
+) -> AadpLinearForm<SP1ExtensionField> {
+    let mut terms = lhs.terms.clone();
+    terms.extend(rhs.terms.iter().map(|(idx, coeff)| (*idx, -*coeff)));
+    AadpLinearForm { constant: lhs.constant - rhs.constant, terms }
 }
 
 fn add_mul_equals_var(
