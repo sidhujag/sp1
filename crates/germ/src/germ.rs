@@ -102,6 +102,9 @@ enum CommitmentWitnessSlot {
     MultiplicativeField { term_idx: usize, field: MultiplicativeTermField },
 }
 
+const MUL_SUMCHECK_ROUND_CHALLENGE_DOMAIN: &[u8] = b"sp1-germ/sumcheck-round-challenge/v3";
+const MUL_SUMCHECK_ROUND_STATE_DOMAIN: &[u8] = b"sp1-germ/sumcheck-round-state/v1";
+
 #[derive(Debug, Clone)]
 struct CommitmentBindingLayout {
     commitment_slots: Vec<CommitmentWitnessSlot>,
@@ -458,27 +461,66 @@ fn build_commitment_binding_layout(
     for descriptor in &residual_plan.multiplicative_descriptors {
         match descriptor {
             MultiplicativeResidualDescriptor::Explicit => {
-                for field in [
-                    MultiplicativeTermField::A,
-                    MultiplicativeTermField::B,
-                    MultiplicativeTermField::C,
-                    MultiplicativeTermField::D,
-                ] {
-                    let field_idx = alloc();
-                    commitment_slots.push(CommitmentWitnessSlot::MultiplicativeField {
-                        term_idx: mul_term_idx,
-                        field,
-                    });
-                    add_commitment_message_affine_entry(
-                        forms.as_mut_slice(),
-                        &seed,
-                        column_idx,
-                        Some(field_idx),
-                        ext_one(),
-                        ext_zero(),
-                    );
-                    column_idx += 1;
-                }
+                let a_idx = alloc();
+                commitment_slots.push(CommitmentWitnessSlot::MultiplicativeField {
+                    term_idx: mul_term_idx,
+                    field: MultiplicativeTermField::A,
+                });
+                add_commitment_message_affine_entry(
+                    forms.as_mut_slice(),
+                    &seed,
+                    column_idx,
+                    Some(a_idx),
+                    ext_one(),
+                    ext_zero(),
+                );
+                column_idx += 1;
+
+                let b_idx = alloc();
+                commitment_slots.push(CommitmentWitnessSlot::MultiplicativeField {
+                    term_idx: mul_term_idx,
+                    field: MultiplicativeTermField::B,
+                });
+                add_commitment_message_affine_entry(
+                    forms.as_mut_slice(),
+                    &seed,
+                    column_idx,
+                    Some(b_idx),
+                    ext_one(),
+                    ext_zero(),
+                );
+                column_idx += 1;
+
+                let c_idx = alloc();
+                commitment_slots.push(CommitmentWitnessSlot::MultiplicativeField {
+                    term_idx: mul_term_idx,
+                    field: MultiplicativeTermField::C,
+                });
+                add_commitment_message_affine_entry(
+                    forms.as_mut_slice(),
+                    &seed,
+                    column_idx,
+                    Some(c_idx),
+                    ext_one(),
+                    ext_zero(),
+                );
+                column_idx += 1;
+
+                let d_idx = alloc();
+                commitment_slots.push(CommitmentWitnessSlot::MultiplicativeField {
+                    term_idx: mul_term_idx,
+                    field: MultiplicativeTermField::D,
+                });
+                add_commitment_message_affine_entry(
+                    forms.as_mut_slice(),
+                    &seed,
+                    column_idx,
+                    Some(d_idx),
+                    ext_one(),
+                    ext_zero(),
+                );
+                column_idx += 1;
+
             }
             MultiplicativeResidualDescriptor::DegreeBitBooleanity { .. } => {
                 let (chip_name, bit_number) = match descriptor {
@@ -536,6 +578,7 @@ fn build_commitment_binding_layout(
                     ext_one(),
                 );
                 column_idx += 1;
+
             }
             MultiplicativeResidualDescriptor::DegreeHeightProduct { .. } => {
                 let (chip_name, bit_number) = match descriptor {
@@ -605,6 +648,7 @@ fn build_commitment_binding_layout(
                     ext_one(),
                 );
                 column_idx += 1;
+
             }
             MultiplicativeResidualDescriptor::GkrPowWitness
             | MultiplicativeResidualDescriptor::GkrCumulativeSum
@@ -653,31 +697,36 @@ fn build_commitment_binding_layout(
                     ext_one(),
                 );
                 column_idx += 1;
+
             }
             MultiplicativeResidualDescriptor::GkrDenominatorInverse { .. } => {
-                for field in [MultiplicativeTermField::A, MultiplicativeTermField::B] {
-                    let field_idx = alloc();
-                    commitment_slots.push(CommitmentWitnessSlot::MultiplicativeField {
-                        term_idx: mul_term_idx,
-                        field,
-                    });
-                    add_commitment_message_affine_entry(
-                        forms.as_mut_slice(),
-                        &seed,
-                        column_idx,
-                        Some(field_idx),
-                        ext_one(),
-                        ext_zero(),
-                    );
-                    column_idx += 1;
-                }
+                let denominator_idx = alloc();
+                commitment_slots.push(CommitmentWitnessSlot::MultiplicativeField {
+                    term_idx: mul_term_idx,
+                    field: MultiplicativeTermField::A,
+                });
                 add_commitment_message_affine_entry(
                     forms.as_mut_slice(),
                     &seed,
                     column_idx,
-                    None,
-                    ext_zero(),
+                    Some(denominator_idx),
                     ext_one(),
+                    ext_zero(),
+                );
+                column_idx += 1;
+
+                let inverse_idx = alloc();
+                commitment_slots.push(CommitmentWitnessSlot::MultiplicativeField {
+                    term_idx: mul_term_idx,
+                    field: MultiplicativeTermField::B,
+                });
+                add_commitment_message_affine_entry(
+                    forms.as_mut_slice(),
+                    &seed,
+                    column_idx,
+                    Some(inverse_idx),
+                    ext_one(),
+                    ext_zero(),
                 );
                 column_idx += 1;
                 add_commitment_message_affine_entry(
@@ -689,28 +738,62 @@ fn build_commitment_binding_layout(
                     ext_one(),
                 );
                 column_idx += 1;
+                add_commitment_message_affine_entry(
+                    forms.as_mut_slice(),
+                    &seed,
+                    column_idx,
+                    None,
+                    ext_zero(),
+                    ext_one(),
+                );
+                column_idx += 1;
+
             }
             MultiplicativeResidualDescriptor::GkrRoundFinalEval { .. } => {
-                for field in [
-                    MultiplicativeTermField::A,
-                    MultiplicativeTermField::B,
-                    MultiplicativeTermField::C,
-                ] {
-                    let field_idx = alloc();
-                    commitment_slots.push(CommitmentWitnessSlot::MultiplicativeField {
-                        term_idx: mul_term_idx,
-                        field,
-                    });
-                    add_commitment_message_affine_entry(
-                        forms.as_mut_slice(),
-                        &seed,
-                        column_idx,
-                        Some(field_idx),
-                        ext_one(),
-                        ext_zero(),
-                    );
-                    column_idx += 1;
-                }
+                let eq_eval_idx = alloc();
+                commitment_slots.push(CommitmentWitnessSlot::MultiplicativeField {
+                    term_idx: mul_term_idx,
+                    field: MultiplicativeTermField::A,
+                });
+                add_commitment_message_affine_entry(
+                    forms.as_mut_slice(),
+                    &seed,
+                    column_idx,
+                    Some(eq_eval_idx),
+                    ext_one(),
+                    ext_zero(),
+                );
+                column_idx += 1;
+
+                let combined_idx = alloc();
+                commitment_slots.push(CommitmentWitnessSlot::MultiplicativeField {
+                    term_idx: mul_term_idx,
+                    field: MultiplicativeTermField::B,
+                });
+                add_commitment_message_affine_entry(
+                    forms.as_mut_slice(),
+                    &seed,
+                    column_idx,
+                    Some(combined_idx),
+                    ext_one(),
+                    ext_zero(),
+                );
+                column_idx += 1;
+
+                let final_eval_idx = alloc();
+                commitment_slots.push(CommitmentWitnessSlot::MultiplicativeField {
+                    term_idx: mul_term_idx,
+                    field: MultiplicativeTermField::C,
+                });
+                add_commitment_message_affine_entry(
+                    forms.as_mut_slice(),
+                    &seed,
+                    column_idx,
+                    Some(final_eval_idx),
+                    ext_one(),
+                    ext_zero(),
+                );
+                column_idx += 1;
                 add_commitment_message_affine_entry(
                     forms.as_mut_slice(),
                     &seed,
@@ -720,6 +803,7 @@ fn build_commitment_binding_layout(
                     ext_one(),
                 );
                 column_idx += 1;
+
             }
         }
         mul_term_idx += 1;
@@ -1422,11 +1506,11 @@ pub fn compile_germ_aadp_template(
         linear_round_checks += 1;
     }
 
-    // Packed sumcheck verifier with schedule-fixed number of rounds.
+    // Packed sumcheck verifier with round-chained extractor updates.
     let mut claimed_prev_idx: Option<usize> = None;
     let mut round_challenge_indices = Vec::with_capacity(usize::from(capsule.sumcheck_rounds));
-    let round_domain = bytes_to_extension(b"sp1-germ/sumcheck-round-challenge/v2");
-    for round_idx in 0..usize::from(capsule.sumcheck_rounds) {
+    let mut round_state_idx = sumcheck_seed_idx;
+    for _round_idx in 0..usize::from(capsule.sumcheck_rounds) {
         let eval_indices = [alloc(), alloc(), alloc(), alloc()];
 
         let mut identity_terms = vec![(eval_indices[0], ext_one()), (eval_indices[1], ext_one())];
@@ -1439,24 +1523,12 @@ pub fn compile_germ_aadp_template(
         );
         linear_round_checks += 1;
 
-        // r_sc = Challenge(sumcheck_seed, idx=round_idx).
-        let (_r_sc_seed_sq_idx, r_sc_seed_state_idx) = add_absorb_constraints(
+        let r_sc_idx = add_challenge_from_seed_constraints(
             &mut constraints,
             &mut alloc,
-            None,
-            round_domain,
-            Some(sumcheck_seed_idx),
-            ext_zero(),
-            (round_idx as u32).wrapping_add(11),
-        );
-        let (_r_sc_idx_sq_idx, r_sc_idx) = add_absorb_constraints(
-            &mut constraints,
-            &mut alloc,
-            Some(r_sc_seed_state_idx),
-            ext_zero(),
-            None,
-            ext_from_u32(round_idx as u32),
-            (round_idx as u32).wrapping_add(13),
+            MUL_SUMCHECK_ROUND_CHALLENGE_DOMAIN,
+            round_state_idx,
+            0,
         );
         multiplication_gates += 4;
         round_challenge_indices.push(r_sc_idx);
@@ -1524,6 +1596,15 @@ pub fn compile_germ_aadp_template(
             },
         );
         linear_round_checks += 1;
+
+        round_state_idx = add_sumcheck_round_state_constraints(
+            &mut constraints,
+            &mut alloc,
+            round_state_idx,
+            eval_indices,
+            claimed_next_idx,
+        );
+        multiplication_gates += 12;
         claimed_prev_idx = Some(claimed_next_idx);
     }
 
@@ -1531,6 +1612,7 @@ pub fn compile_germ_aadp_template(
     let opening_b_idx = alloc();
     let opening_c_idx = alloc();
     let opening_d_idx = alloc();
+
     let opening_lhs_product_idx = alloc();
     let opening_rhs_product_idx = alloc();
 
@@ -1936,28 +2018,16 @@ pub fn materialize_transcript_bound_germ_aadp_witness(
     let inv2 = ext_from_u32(2).try_inverse().expect("2 must be invertible in SP1 extension field");
     let inv6 = ext_from_u32(6).try_inverse().expect("6 must be invertible in SP1 extension field");
 
+    let mut round_state = sumcheck_seed;
     let mut point = Vec::with_capacity(mul_proof.nvars as usize);
     let mut sampled = Vec::with_capacity(mul_proof.rounds.len());
-    for (round_idx, round) in mul_proof.rounds.iter().enumerate() {
+    for round in &mul_proof.rounds {
         for eval in round.evaluations {
             push(&mut witness, eval);
         }
 
-        // r_sc derivation trace.
-        let r_sc_seed_absorb = bytes_to_extension(b"sp1-germ/sumcheck-round-challenge/v2")
-            + sumcheck_seed
-            + absorb_round_constant((round_idx as u32).wrapping_add(11));
-        let r_sc_seed_absorb_sq = r_sc_seed_absorb * r_sc_seed_absorb;
-        let r_sc_seed_state = r_sc_seed_absorb_sq * (r_sc_seed_absorb + ext_one());
-        push(&mut witness, r_sc_seed_absorb_sq);
-        push(&mut witness, r_sc_seed_state);
-        let r_sc_idx_absorb = r_sc_seed_state
-            + ext_from_u32(round_idx as u32)
-            + absorb_round_constant((round_idx as u32).wrapping_add(13));
-        let r_sc_idx_absorb_sq = r_sc_idx_absorb * r_sc_idx_absorb;
-        let r_sc = r_sc_idx_absorb_sq * (r_sc_idx_absorb + ext_one());
-        push(&mut witness, r_sc_idx_absorb_sq);
-        push(&mut witness, r_sc);
+        let r_sc =
+            materialize_challenge_from_seed_trace(&mut witness, MUL_SUMCHECK_ROUND_CHALLENGE_DOMAIN, round_state, 0);
 
         sampled.push(r_sc);
 
@@ -1974,12 +2044,14 @@ pub fn materialize_transcript_bound_germ_aadp_witness(
 
         let claimed_next = e[0] + m_c;
         push(&mut witness, claimed_next);
+        round_state = materialize_sumcheck_round_state_trace(&mut witness, round_state, &e, claimed_next);
     }
 
     push(&mut witness, mul_proof.opening.a);
     push(&mut witness, mul_proof.opening.b);
     push(&mut witness, mul_proof.opening.c);
     push(&mut witness, mul_proof.opening.d);
+
     let opening_lhs_product = mul_proof.opening.a * mul_proof.opening.b;
     let opening_rhs_product = mul_proof.opening.c * mul_proof.opening.d;
     push(&mut witness, opening_lhs_product);
@@ -2223,16 +2295,25 @@ fn derive_mul_point(seed: &SP1ExtensionField, nvars: usize) -> Vec<SP1ExtensionF
     out
 }
 
-fn derive_sumcheck_round_challenge(
-    seed: &SP1ExtensionField,
-    round_idx: usize,
+fn derive_sumcheck_round_challenge(round_state: &SP1ExtensionField) -> SP1ExtensionField {
+    derive_algebraic_challenge(MUL_SUMCHECK_ROUND_CHALLENGE_DOMAIN, *round_state, &[], 0)
+}
+
+fn update_sumcheck_round_state(
+    prev_state: &SP1ExtensionField,
+    evals: &[SP1ExtensionField; 4],
+    claim: &SP1ExtensionField,
 ) -> SP1ExtensionField {
-    derive_algebraic_challenge(
-        b"sp1-germ/sumcheck-round-challenge/v2",
-        *seed,
-        &[],
-        round_idx as u32,
-    )
+    let mut state = algebraic_absorb(
+        bytes_to_extension(MUL_SUMCHECK_ROUND_STATE_DOMAIN),
+        *prev_state,
+        11,
+    );
+    state = algebraic_absorb(state, evals[0], 13);
+    state = algebraic_absorb(state, evals[1], 15);
+    state = algebraic_absorb(state, evals[2], 17);
+    state = algebraic_absorb(state, evals[3], 19);
+    algebraic_absorb(state, *claim, 21)
 }
 
 fn interpolate_0123(
@@ -2361,6 +2442,185 @@ fn add_bit_constraint(constraints: &mut Vec<AadpMulConstraint<SP1ExtensionField>
     });
 }
 
+fn add_challenge_from_seed_constraints<A: FnMut() -> usize>(
+    constraints: &mut Vec<AadpMulConstraint<SP1ExtensionField>>,
+    alloc: &mut A,
+    domain: &[u8],
+    seed_idx: usize,
+    challenge_index: u32,
+) -> usize {
+    let (_seed_sq_idx, seed_state_idx) = add_absorb_constraints(
+        constraints,
+        alloc,
+        None,
+        bytes_to_extension(domain),
+        Some(seed_idx),
+        ext_zero(),
+        challenge_index.wrapping_add(11),
+    );
+    let (_idx_sq_idx, challenge_idx_var) = add_absorb_constraints(
+        constraints,
+        alloc,
+        Some(seed_state_idx),
+        ext_zero(),
+        None,
+        ext_from_u32(challenge_index),
+        challenge_index.wrapping_add(13),
+    );
+    challenge_idx_var
+}
+
+fn add_sumcheck_round_state_constraints<A: FnMut() -> usize>(
+    constraints: &mut Vec<AadpMulConstraint<SP1ExtensionField>>,
+    alloc: &mut A,
+    prev_state_idx: usize,
+    eval_indices: [usize; 4],
+    claim_idx: usize,
+) -> usize {
+    let (_prev_sq_idx, after_prev_idx) = add_absorb_constraints(
+        constraints,
+        alloc,
+        None,
+        bytes_to_extension(MUL_SUMCHECK_ROUND_STATE_DOMAIN),
+        Some(prev_state_idx),
+        ext_zero(),
+        11,
+    );
+    let (_eval0_sq_idx, after_eval0_idx) = add_absorb_constraints(
+        constraints,
+        alloc,
+        Some(after_prev_idx),
+        ext_zero(),
+        Some(eval_indices[0]),
+        ext_zero(),
+        13,
+    );
+    let (_eval1_sq_idx, after_eval1_idx) = add_absorb_constraints(
+        constraints,
+        alloc,
+        Some(after_eval0_idx),
+        ext_zero(),
+        Some(eval_indices[1]),
+        ext_zero(),
+        15,
+    );
+    let (_eval2_sq_idx, after_eval2_idx) = add_absorb_constraints(
+        constraints,
+        alloc,
+        Some(after_eval1_idx),
+        ext_zero(),
+        Some(eval_indices[2]),
+        ext_zero(),
+        17,
+    );
+    let (_eval3_sq_idx, after_eval3_idx) = add_absorb_constraints(
+        constraints,
+        alloc,
+        Some(after_eval2_idx),
+        ext_zero(),
+        Some(eval_indices[3]),
+        ext_zero(),
+        19,
+    );
+    let (_claim_sq_idx, next_state_idx) = add_absorb_constraints(
+        constraints,
+        alloc,
+        Some(after_eval3_idx),
+        ext_zero(),
+        Some(claim_idx),
+        ext_zero(),
+        21,
+    );
+    next_state_idx
+}
+
+fn materialize_absorb_trace(
+    witness: &mut Vec<SP1ExtensionField>,
+    prev_state: Option<SP1ExtensionField>,
+    prev_const: SP1ExtensionField,
+    value: Option<SP1ExtensionField>,
+    value_const: SP1ExtensionField,
+    round_idx: u32,
+) -> SP1ExtensionField {
+    let absorb = prev_state.unwrap_or_else(ext_zero)
+        + prev_const
+        + value.unwrap_or_else(ext_zero)
+        + value_const
+        + absorb_round_constant(round_idx);
+    let absorb_sq = absorb * absorb;
+    let next_state = absorb_sq * (absorb + ext_one());
+    witness.push(absorb_sq);
+    witness.push(next_state);
+    next_state
+}
+
+fn materialize_challenge_from_seed_trace(
+    witness: &mut Vec<SP1ExtensionField>,
+    domain: &[u8],
+    seed: SP1ExtensionField,
+    challenge_index: u32,
+) -> SP1ExtensionField {
+    let seed_state = materialize_absorb_trace(
+        witness,
+        None,
+        bytes_to_extension(domain),
+        Some(seed),
+        ext_zero(),
+        challenge_index.wrapping_add(11),
+    );
+    materialize_absorb_trace(
+        witness,
+        Some(seed_state),
+        ext_zero(),
+        None,
+        ext_from_u32(challenge_index),
+        challenge_index.wrapping_add(13),
+    )
+}
+
+fn materialize_sumcheck_round_state_trace(
+    witness: &mut Vec<SP1ExtensionField>,
+    prev_state: SP1ExtensionField,
+    evals: &[SP1ExtensionField; 4],
+    claim: SP1ExtensionField,
+) -> SP1ExtensionField {
+    let after_prev = materialize_absorb_trace(
+        witness,
+        None,
+        bytes_to_extension(MUL_SUMCHECK_ROUND_STATE_DOMAIN),
+        Some(prev_state),
+        ext_zero(),
+        11,
+    );
+    let after_eval0 =
+        materialize_absorb_trace(witness, Some(after_prev), ext_zero(), Some(evals[0]), ext_zero(), 13);
+    let after_eval1 = materialize_absorb_trace(
+        witness,
+        Some(after_eval0),
+        ext_zero(),
+        Some(evals[1]),
+        ext_zero(),
+        15,
+    );
+    let after_eval2 = materialize_absorb_trace(
+        witness,
+        Some(after_eval1),
+        ext_zero(),
+        Some(evals[2]),
+        ext_zero(),
+        17,
+    );
+    let after_eval3 = materialize_absorb_trace(
+        witness,
+        Some(after_eval2),
+        ext_zero(),
+        Some(evals[3]),
+        ext_zero(),
+        19,
+    );
+    materialize_absorb_trace(witness, Some(after_eval3), ext_zero(), Some(claim), ext_zero(), 21)
+}
+
 fn eq_table(point: &[SP1ExtensionField]) -> Vec<SP1ExtensionField> {
     if point.is_empty() {
         return vec![ext_one()];
@@ -2446,7 +2706,8 @@ fn prove_mul_sumcheck(seed: &SP1ExtensionField, terms: &[Sp1MulTerm]) -> Sp1MulS
     let mut eq = eq_table(point.as_slice());
     let mut rounds = Vec::with_capacity(nvars);
     let ts = [ext_from_u32(0), ext_from_u32(1), ext_from_u32(2), ext_from_u32(3)];
-    for round_idx in 0..nvars {
+    let mut round_state = *seed;
+    for _round_idx in 0..nvars {
         let mut evals = [ext_zero(), ext_zero(), ext_zero(), ext_zero()];
         for idx in 0..(a_vals.len() / 2) {
             let i0 = 2 * idx;
@@ -2472,7 +2733,10 @@ fn prove_mul_sumcheck(seed: &SP1ExtensionField, terms: &[Sp1MulTerm]) -> Sp1MulS
         }
         let round = Sp1MulSumcheckRound { evaluations: evals };
         rounds.push(round);
-        let r_sc = derive_sumcheck_round_challenge(seed, round_idx);
+        let r_sc = derive_sumcheck_round_challenge(&round_state);
+        let claim_next = interpolate_0123(&evals, r_sc)
+            .expect("sumcheck interpolation over points 0,1,2,3 should be well-defined");
+        round_state = update_sumcheck_round_state(&round_state, &evals, &claim_next);
         a_vals = fold_mle_table(a_vals.as_slice(), r_sc);
         b_vals = fold_mle_table(b_vals.as_slice(), r_sc);
         c_vals = fold_mle_table(c_vals.as_slice(), r_sc);
@@ -2505,14 +2769,16 @@ fn verify_mul_sumcheck(
     let point = derive_mul_point(seed, nvars);
     let mut claimed = ext_zero();
     let mut sampled = Vec::with_capacity(nvars);
+    let mut round_state = *seed;
     for (round_idx, round) in proof.rounds.iter().enumerate() {
         let evals = round.evaluations;
         if evals[0] + evals[1] != claimed {
             return Err(GermError::SumcheckIdentityFailed(round_idx));
         }
-        let r_sc = derive_sumcheck_round_challenge(seed, round_idx);
+        let r_sc = derive_sumcheck_round_challenge(&round_state);
         sampled.push(r_sc);
         claimed = interpolate_0123(&evals, r_sc)?;
+        round_state = update_sumcheck_round_state(&round_state, &evals, &claimed);
     }
 
     let mut eq_eval = ext_one();
@@ -2903,10 +3169,10 @@ mod tests {
             b"mul-proof".to_vec(),
         );
         let public_values = test_public_values();
-        let (commitment_root, _) =
-            bind_bundle(&mut bundle, &public_values).expect("bind should succeed");
         let residual_plan = test_residual_plan();
         let capsule = public_values.arm_capsule(&residual_plan);
+        let (commitment_root, _) =
+            bind_bundle_to_capsule(&mut bundle, &capsule).expect("bind should succeed");
         let template = compile_germ_aadp_template(&capsule, &residual_plan)
             .expect("aadp template compile should succeed");
         let transcript_bound = TranscriptBoundSp1GermProofObject::new(bundle, commitment_root);
@@ -2926,6 +3192,73 @@ mod tests {
     }
 
     #[test]
+    fn materialization_rejects_tampered_mul_round() {
+        let a = ext_from_word(7);
+        let b = ext_from_word(11);
+        let c = ext_from_word(13);
+        let mut bundle = Sp1GermBundle::new(
+            b"shared-object-v1".to_vec(),
+            vec![Sp1LinTerm::new(ext_one(), ext_zero())],
+            vec![Sp1MulTerm::new(a, b, ext_one(), a * b), Sp1MulTerm::new(b, c, ext_one(), b * c)],
+            b"lin-proof".to_vec(),
+            b"mul-proof".to_vec(),
+        );
+        let public_values = test_public_values();
+        let residual_plan = test_residual_plan();
+        let capsule = public_values.arm_capsule(&residual_plan);
+        let (commitment_root, _) =
+            bind_bundle_to_capsule(&mut bundle, &capsule).expect("bind should succeed");
+        let template =
+            compile_germ_aadp_template(&capsule, &residual_plan).expect("template compile");
+
+        let mut mul_proof = decode_mul_sumcheck(&bundle.pi_mul).expect("decode mul proof");
+        let first_round = mul_proof.rounds.first_mut().expect("sumcheck should have one round");
+        first_round.evaluations[0] += ext_one();
+        bundle.pi_mul = encode_mul_sumcheck(&mul_proof);
+
+        let err = materialize_transcript_bound_germ_aadp_witness(
+            &template,
+            &capsule,
+            &TranscriptBoundSp1GermProofObject::new(bundle, commitment_root),
+        )
+        .unwrap_err();
+        assert_eq!(err, GermError::SumcheckTranscriptMismatch);
+    }
+
+    #[test]
+    fn materialization_rejects_tampered_mul_opening() {
+        let a = ext_from_word(7);
+        let b = ext_from_word(11);
+        let c = ext_from_word(13);
+        let mut bundle = Sp1GermBundle::new(
+            b"shared-object-v1".to_vec(),
+            vec![Sp1LinTerm::new(ext_one(), ext_zero())],
+            vec![Sp1MulTerm::new(a, b, ext_one(), a * b), Sp1MulTerm::new(b, c, ext_one(), b * c)],
+            b"lin-proof".to_vec(),
+            b"mul-proof".to_vec(),
+        );
+        let public_values = test_public_values();
+        let residual_plan = test_residual_plan();
+        let capsule = public_values.arm_capsule(&residual_plan);
+        let (commitment_root, _) =
+            bind_bundle_to_capsule(&mut bundle, &capsule).expect("bind should succeed");
+        let template =
+            compile_germ_aadp_template(&capsule, &residual_plan).expect("template compile");
+
+        let mut mul_proof = decode_mul_sumcheck(&bundle.pi_mul).expect("decode mul proof");
+        mul_proof.opening.a += ext_one();
+        bundle.pi_mul = encode_mul_sumcheck(&mul_proof);
+
+        let err = materialize_transcript_bound_germ_aadp_witness(
+            &template,
+            &capsule,
+            &TranscriptBoundSp1GermProofObject::new(bundle, commitment_root),
+        )
+        .unwrap_err();
+        assert_eq!(err, GermError::SumcheckTranscriptMismatch);
+    }
+
+    #[test]
     fn template_rejects_public_context_mismatch() {
         let a = ext_from_word(7);
         let b = ext_from_word(11);
@@ -2937,10 +3270,10 @@ mod tests {
             b"mul-proof".to_vec(),
         );
         let public_values = test_public_values();
-        let (commitment_root, _) =
-            bind_bundle(&mut bundle, &public_values).expect("bind should succeed");
         let residual_plan = test_residual_plan();
         let capsule = public_values.arm_capsule(&residual_plan);
+        let (commitment_root, _) =
+            bind_bundle_to_capsule(&mut bundle, &capsule).expect("bind should succeed");
         let template =
             compile_germ_aadp_template(&capsule, &residual_plan).expect("template compile");
         let transcript_bound = TranscriptBoundSp1GermProofObject::new(bundle, commitment_root);
@@ -2967,11 +3300,11 @@ mod tests {
             b"mul-proof".to_vec(),
         );
         let public_values = test_public_values();
-        let (commitment_root, _) =
-            bind_bundle(&mut bundle, &public_values).expect("bind should succeed");
         let msg = ext_from_word(123);
         let residual_plan = test_residual_plan();
         let capsule = public_values.arm_capsule(&residual_plan);
+        let (commitment_root, _) =
+            bind_bundle_to_capsule(&mut bundle, &capsule).expect("bind should succeed");
         let mut rng = StdRng::seed_from_u64(42);
         let armed = arm_germ_aadp_template(&capsule, &residual_plan, msg, &mut rng)
             .expect("arming template should succeed");
