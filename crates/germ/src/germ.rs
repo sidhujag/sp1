@@ -145,8 +145,8 @@ const MUL_SUMCHECK_ROUND_STATE_DOMAIN: &[u8] = b"sp1-germ/sumcheck-round-state/v
 const ORBWEAVER_AGGREGATED_SCALAR_OPENINGS: usize = 4;
 const ORBWEAVER_SCALAR_IMAGE_COUNT: usize = 16;
 const ORBWEAVER_RING_COEFFS_PER_EXTENSION_BLOCK: usize = 4;
-const ORBWEAVER_JL_PROJECTIONS_PER_TERMINAL: usize = 8;
-const ORBWEAVER_JL_SIGNED_BITS: usize = 15;
+const ORBWEAVER_JL_TOTAL_PROJECTIONS: usize = 8;
+const ORBWEAVER_JL_NORM_BITS: usize = 31;
 
 #[derive(Debug, Clone)]
 struct OrbweaverTranscriptTemplateData {
@@ -155,7 +155,7 @@ struct OrbweaverTranscriptTemplateData {
         [[SP1ExtensionField; 4]; ORBWEAVER_AGGREGATED_SCALAR_OPENINGS],
     c_flat_field_multipliers: Vec<[SP1ExtensionField; 4]>,
     lhs_block_multipliers: Vec<SP1ExtensionField>,
-    jl_rows: Vec<Vec<Vec<i8>>>,
+    jl_rows: Vec<Vec<i8>>,
     proof_commitment: Sp1PackageCommitment,
     proof_pi_len: usize,
 }
@@ -441,14 +441,35 @@ fn packed_scalar_opening_blocks(proof: &crate::orbweaver_opening::OrbweaverScala
     out
 }
 
+fn packed_scalar_opening_family_blocks(
+    proofs: &[crate::orbweaver_opening::OrbweaverScalarOpeningProof; ORBWEAVER_AGGREGATED_SCALAR_OPENINGS],
+) -> Vec<SP1ExtensionField> {
+    let mut out = Vec::new();
+    for proof in proofs {
+        out.extend(packed_scalar_opening_blocks(proof));
+    }
+    out
+}
+
+fn orbweaver_output_field_multipliers(
+    aggregation_coeffs: &[SP1Field; ORBWEAVER_SCALAR_IMAGE_COUNT],
+) -> [SP1ExtensionField; 4] {
+    core::array::from_fn(|field_idx| {
+        let start = field_idx * 4;
+        first_limb_functional_multiplier(
+            aggregation_coeffs[start..start + 4]
+                .try_into()
+                .expect("orbweaver output multiplier slice has 4 coefficients"),
+        )
+    })
+}
+
 fn orbweaver_proof_commitment_message(
     proofs: &[crate::orbweaver_opening::OrbweaverScalarOpeningProof; ORBWEAVER_AGGREGATED_SCALAR_OPENINGS],
 ) -> Vec<SP1ExtensionField> {
     let mut out = Vec::new();
     out.push(domain_tag_extension(b"sp1-germ/orbweaver/proof-commit/v1"));
-    for proof in proofs {
-        out.extend(packed_scalar_opening_blocks(proof));
-    }
+    out.extend(packed_scalar_opening_family_blocks(proofs));
     out
 }
 
@@ -503,19 +524,6 @@ fn derive_orbweaver_jl_seed(
     h.update(b"sp1-germ/orbweaver-jl-seed-bytes/v1");
     hash_extension_value(&mut h, &jl_seed);
     h.finalize().into()
-}
-
-fn orbweaver_output_field_multipliers(
-    aggregation_coeffs: &[SP1Field; ORBWEAVER_SCALAR_IMAGE_COUNT],
-) -> [SP1ExtensionField; 4] {
-    core::array::from_fn(|field_idx| {
-        let start = field_idx * 4;
-        first_limb_functional_multiplier(
-            aggregation_coeffs[start..start + 4]
-                .try_into()
-                .expect("orbweaver output multiplier slice has 4 coefficients"),
-        )
-    })
 }
 
 fn orbweaver_c_flat_field_multipliers(
@@ -628,7 +636,10 @@ fn build_orbweaver_transcript_template_data(
         &proof_commitment,
         srs,
     );
-    let jl_rows = derive_orbweaver_jl_rows(&jl_seed, proof_pi_len * KOALA_RING64_DIM);
+    let jl_rows = derive_orbweaver_jl_rows(
+        &jl_seed,
+        ORBWEAVER_AGGREGATED_SCALAR_OPENINGS * proof_pi_len * KOALA_RING64_DIM,
+    );
     Ok(OrbweaverTranscriptTemplateData {
         aggregated_vk_values,
         aggregated_output_multipliers,
@@ -2386,167 +2397,112 @@ fn compile_germ_aadp_template_internal(
                 column_idx += 1;
             }
         }
+        let flat_proof_block_indices = proof_block_indices
+            .iter()
+            .flat_map(|indices| indices.iter().copied())
+            .collect::<Vec<_>>();
+        let mut projection_square_indices = Vec::with_capacity(ORBWEAVER_JL_TOTAL_PROJECTIONS);
         for form in proof_commitment_forms {
             add_linear_zero_constraint(&mut constraints, form);
             opening_checks += 1;
         }
 
-        let c_flat_ext_idx = alloc();
-        let c_flat_limb_indices = [alloc(), alloc(), alloc(), alloc()];
-        let mut c_flat_form =
-            AadpLinearForm { constant: ext_zero(), terms: vec![(c_flat_ext_idx, ext_one())] };
+        let mut c_flat_form = linear_form_constant(ext_zero());
         for (field_multipliers, exprs) in orbweaver_data
             .c_flat_field_multipliers
             .iter()
             .zip(binding_layout.multiplicative_field_exprs.iter())
         {
             for field_idx in 0..4 {
-                add_scaled_affine_expr(&mut c_flat_form, exprs[field_idx], -field_multipliers[field_idx]);
+                add_scaled_affine_expr(&mut c_flat_form, exprs[field_idx], field_multipliers[field_idx]);
             }
         }
-        add_linear_zero_constraint(&mut constraints, c_flat_form);
-        opening_checks += 1;
-        add_linear_zero_constraint(
-            &mut constraints,
-            AadpLinearForm {
-                constant: ext_zero(),
-                terms: vec![
-                    (c_flat_ext_idx, ext_one()),
-                    (c_flat_limb_indices[0], -ext_one()),
-                    (c_flat_limb_indices[1], -ext_basis_u()),
-                    (c_flat_limb_indices[2], -ext_basis_u_squared()),
-                    (c_flat_limb_indices[3], -ext_basis_u_cubed()),
-                ],
-            },
-        );
-        opening_checks += 1;
-
         let opening_indices = [opening_a_idx, opening_b_idx, opening_c_idx, opening_d_idx];
         for proof_idx in 0..ORBWEAVER_AGGREGATED_SCALAR_OPENINGS {
-            let lhs_ext_idx = alloc();
-            let lhs_limb_indices = [alloc(), alloc(), alloc(), alloc()];
-            let mut lhs_form =
-                AadpLinearForm { constant: ext_zero(), terms: vec![(lhs_ext_idx, ext_one())] };
+            let mut lhs_form = linear_form_constant(ext_zero());
             for (block_idx, coeff) in proof_block_indices[proof_idx]
                 .iter()
                 .zip(orbweaver_data.lhs_block_multipliers.iter())
             {
-                lhs_form.terms.push((*block_idx, -*coeff));
+                lhs_form.terms.push((*block_idx, *coeff));
             }
-            add_linear_zero_constraint(&mut constraints, lhs_form);
-            opening_checks += 1;
-            add_linear_zero_constraint(
-                &mut constraints,
-                AadpLinearForm {
-                    constant: ext_zero(),
-                    terms: vec![
-                        (lhs_ext_idx, ext_one()),
-                        (lhs_limb_indices[0], -ext_one()),
-                        (lhs_limb_indices[1], -ext_basis_u()),
-                        (lhs_limb_indices[2], -ext_basis_u_squared()),
-                        (lhs_limb_indices[3], -ext_basis_u_cubed()),
-                    ],
-                },
+            let mut opening_form = linear_form_add_forms(
+                &lhs_form,
+                &linear_form_scale(
+                    &c_flat_form,
+                    -ext_from_base_field(orbweaver_data.aggregated_vk_values[proof_idx]),
+                ),
             );
-            opening_checks += 1;
-
-            let output_ext_idx = alloc();
-            let output_limb_indices = [alloc(), alloc(), alloc(), alloc()];
-            let mut output_form =
-                AadpLinearForm { constant: ext_zero(), terms: vec![(output_ext_idx, ext_one())] };
             for field_idx in 0..4 {
-                output_form
-                    .terms
-                    .push((opening_indices[field_idx], -orbweaver_data.aggregated_output_multipliers[proof_idx][field_idx]));
+                opening_form.terms.push((
+                    opening_indices[field_idx],
+                    orbweaver_data.aggregated_output_multipliers[proof_idx][field_idx],
+                ));
             }
-            add_linear_zero_constraint(&mut constraints, output_form);
+            let opening_limb_indices = [alloc(), alloc(), alloc(), alloc()];
+            opening_form.terms.push((opening_limb_indices[0], -ext_one()));
+            opening_form.terms.push((opening_limb_indices[1], -ext_basis_u()));
+            opening_form.terms.push((opening_limb_indices[2], -ext_basis_u_squared()));
+            opening_form.terms.push((opening_limb_indices[3], -ext_basis_u_cubed()));
+            add_linear_zero_constraint(&mut constraints, opening_form);
             opening_checks += 1;
             add_linear_zero_constraint(
                 &mut constraints,
                 AadpLinearForm {
                     constant: ext_zero(),
-                    terms: vec![
-                        (output_ext_idx, ext_one()),
-                        (output_limb_indices[0], -ext_one()),
-                        (output_limb_indices[1], -ext_basis_u()),
-                        (output_limb_indices[2], -ext_basis_u_squared()),
-                        (output_limb_indices[3], -ext_basis_u_cubed()),
-                    ],
+                    terms: vec![(opening_limb_indices[0], ext_one())],
                 },
             );
             opening_checks += 1;
-
-            add_linear_zero_constraint(
-                &mut constraints,
-                AadpLinearForm {
-                    constant: ext_zero(),
-                    terms: vec![
-                        (lhs_limb_indices[0], ext_one()),
-                        (c_flat_limb_indices[0], -ext_from_base_field(orbweaver_data.aggregated_vk_values[proof_idx])),
-                        (output_limb_indices[0], ext_one()),
-                    ],
-                },
-            );
-            opening_checks += 1;
-
-            for row in &orbweaver_data.jl_rows[proof_idx] {
-                let row_weights = row
-                    .iter()
-                    .map(|coeff| match *coeff {
-                        1 => SP1Field::one(),
-                        -1 => -SP1Field::one(),
-                        _ => SP1Field::zero(),
-                    })
-                    .collect::<Vec<_>>();
-                let row_multipliers =
-                    pack_scalar_weights_to_extension_multipliers(row_weights.as_slice());
-                let projection_ext_idx = alloc();
-                let projection_limb_indices = [alloc(), alloc(), alloc(), alloc()];
-                let mut projection_form = AadpLinearForm {
-                    constant: ext_zero(),
-                    terms: vec![(projection_ext_idx, ext_one())],
-                };
-                for (block_idx, coeff) in
-                    proof_block_indices[proof_idx].iter().zip(row_multipliers.iter())
-                {
-                    projection_form.terms.push((*block_idx, -*coeff));
-                }
-                add_linear_zero_constraint(&mut constraints, projection_form);
-                opening_checks += 1;
-                add_linear_zero_constraint(
-                    &mut constraints,
-                    AadpLinearForm {
-                        constant: ext_zero(),
-                        terms: vec![
-                            (projection_ext_idx, ext_one()),
-                            (projection_limb_indices[0], -ext_one()),
-                            (projection_limb_indices[1], -ext_basis_u()),
-                            (projection_limb_indices[2], -ext_basis_u_squared()),
-                            (projection_limb_indices[3], -ext_basis_u_cubed()),
-                        ],
-                    },
-                );
-                opening_checks += 1;
-
-                let mut signed_terms = vec![(projection_limb_indices[0], ext_one())];
-                for bit in 0..ORBWEAVER_JL_SIGNED_BITS {
-                    let bit_idx = alloc();
-                    add_bit_constraint(&mut constraints, bit_idx);
-                    multiplication_gates += 1;
-                    let bit_weight = if bit + 1 == ORBWEAVER_JL_SIGNED_BITS {
-                        -(1i64 << (ORBWEAVER_JL_SIGNED_BITS - 1))
-                    } else {
-                        1i64 << bit
-                    };
-                    signed_terms.push((bit_idx, -ext_from_i64(bit_weight)));
-                }
-                add_linear_zero_constraint(
-                    &mut constraints,
-                    AadpLinearForm { constant: ext_zero(), terms: signed_terms },
-                );
-                opening_checks += 1;
-            }
         }
+        for row in &orbweaver_data.jl_rows {
+            let row_weights = row
+                .iter()
+                .map(|coeff| match *coeff {
+                    1 => SP1Field::one(),
+                    -1 => -SP1Field::one(),
+                    _ => SP1Field::zero(),
+                })
+                .collect::<Vec<_>>();
+            let row_multipliers =
+                pack_scalar_weights_to_extension_multipliers(row_weights.as_slice());
+            let mut projection_form = linear_form_constant(ext_zero());
+            for (block_idx, coeff) in flat_proof_block_indices.iter().zip(row_multipliers.iter()) {
+                projection_form.terms.push((*block_idx, *coeff));
+            }
+            let projection_limb_indices = [alloc(), alloc(), alloc(), alloc()];
+            projection_form.terms.push((projection_limb_indices[0], -ext_one()));
+            projection_form.terms.push((projection_limb_indices[1], -ext_basis_u()));
+            projection_form.terms.push((projection_limb_indices[2], -ext_basis_u_squared()));
+            projection_form.terms.push((projection_limb_indices[3], -ext_basis_u_cubed()));
+            add_linear_zero_constraint(&mut constraints, projection_form);
+            opening_checks += 1;
+            let square_idx = alloc();
+            add_mul_equals_var(
+                &mut constraints,
+                linear_form_single_var(projection_limb_indices[0]),
+                linear_form_single_var(projection_limb_indices[0]),
+                square_idx,
+            );
+            multiplication_gates += 1;
+            projection_square_indices.push(square_idx);
+        }
+        let mut jl_norm_bits_terms =
+            Vec::with_capacity(projection_square_indices.len() + ORBWEAVER_JL_NORM_BITS);
+        for square_idx in projection_square_indices {
+            jl_norm_bits_terms.push((square_idx, ext_one()));
+        }
+        for bit in 0..ORBWEAVER_JL_NORM_BITS {
+            let bit_idx = alloc();
+            add_bit_constraint(&mut constraints, bit_idx);
+            multiplication_gates += 1;
+            jl_norm_bits_terms.push((bit_idx, -ext_from_u32(1u32 << bit)));
+        }
+        add_linear_zero_constraint(
+            &mut constraints,
+            AadpLinearForm { constant: ext_zero(), terms: jl_norm_bits_terms },
+        );
+        opening_checks += 1;
         orbweaver_data.proof_pi_len
     } else if let Some(weights) = terminal_opening_weights {
         if weights.len() != binding_layout.multiplicative_field_exprs.len() {
@@ -3094,90 +3050,87 @@ fn materialize_transcript_bound_germ_aadp_witness_internal(
             });
         }
         let proofs = decode_orbweaver_aggregated_scalar_openings(&proof_object.pi_mul_terminal_openings)?;
-        for proof in &proofs {
-            for packed in packed_scalar_opening_blocks(proof) {
-                push(&mut witness, packed);
+        let proof_blocks_by_proof = proofs
+            .iter()
+            .map(packed_scalar_opening_blocks)
+            .collect::<Vec<_>>();
+        let all_proof_blocks = packed_scalar_opening_family_blocks(&proofs);
+        for packed in &all_proof_blocks {
+            push(&mut witness, *packed);
+        }
+        let mut c_flat_ext = ext_zero();
+        for (field_multipliers, term) in orbweaver_data
+            .c_flat_field_multipliers
+            .iter()
+            .zip(proof_object.mul_terms.iter())
+        {
+            let fields = [term.a, term.b, term.c, term.d];
+            for field_idx in 0..4 {
+                c_flat_ext += field_multipliers[field_idx] * fields[field_idx];
             }
         }
-
-        let mut c_flat_ext = ext_zero();
-        for (term, field_multipliers) in proof_object
-            .mul_terms
-            .iter()
-            .zip(orbweaver_data.c_flat_field_multipliers.iter())
-        {
-            c_flat_ext += field_multipliers[0] * term.a;
-            c_flat_ext += field_multipliers[1] * term.b;
-            c_flat_ext += field_multipliers[2] * term.c;
-            c_flat_ext += field_multipliers[3] * term.d;
-        }
-        push(&mut witness, c_flat_ext);
-        for limb in <SP1ExtensionField as AbstractExtensionField<SP1Field>>::as_base_slice(&c_flat_ext) {
-            push(&mut witness, ext_from_base_field(*limb));
-        }
-
-        let opening_values = [
-            mul_proof.opening.a,
-            mul_proof.opening.b,
-            mul_proof.opening.c,
-            mul_proof.opening.d,
-        ];
-        for (proof_idx, proof) in proofs.iter().enumerate() {
-            let proof_blocks = packed_scalar_opening_blocks(proof);
+        let opening_values = [mul_proof.opening.a, mul_proof.opening.b, mul_proof.opening.c, mul_proof.opening.d];
+        for proof_idx in 0..ORBWEAVER_AGGREGATED_SCALAR_OPENINGS {
             let mut lhs_ext = ext_zero();
-            for (packed, coeff) in proof_blocks.iter().zip(orbweaver_data.lhs_block_multipliers.iter()) {
+            for (packed, coeff) in proof_blocks_by_proof[proof_idx]
+                .iter()
+                .zip(orbweaver_data.lhs_block_multipliers.iter())
+            {
                 lhs_ext += *coeff * *packed;
             }
-            push(&mut witness, lhs_ext);
-            for limb in
-                <SP1ExtensionField as AbstractExtensionField<SP1Field>>::as_base_slice(&lhs_ext)
-            {
-                push(&mut witness, ext_from_base_field(*limb));
-            }
-
-            let mut output_ext = ext_zero();
+            let mut opening_ext =
+                lhs_ext + ((-ext_from_base_field(orbweaver_data.aggregated_vk_values[proof_idx])) * c_flat_ext);
             for field_idx in 0..4 {
-                output_ext +=
+                opening_ext +=
                     orbweaver_data.aggregated_output_multipliers[proof_idx][field_idx]
                         * opening_values[field_idx];
             }
-            push(&mut witness, output_ext);
-            for limb in
-                <SP1ExtensionField as AbstractExtensionField<SP1Field>>::as_base_slice(&output_ext)
-            {
+            let opening_limbs =
+                <SP1ExtensionField as AbstractExtensionField<SP1Field>>::as_base_slice(
+                    &opening_ext,
+                );
+            for limb in opening_limbs {
                 push(&mut witness, ext_from_base_field(*limb));
             }
+        }
 
-            for row in &orbweaver_data.jl_rows[proof_idx] {
-                let row_weights = row
-                    .iter()
-                    .map(|coeff| match *coeff {
-                        1 => SP1Field::one(),
-                        -1 => -SP1Field::one(),
-                        _ => SP1Field::zero(),
-                    })
-                    .collect::<Vec<_>>();
-                let row_multipliers =
-                    pack_scalar_weights_to_extension_multipliers(row_weights.as_slice());
-                let mut projection_ext = ext_zero();
-                for (packed, coeff) in proof_blocks.iter().zip(row_multipliers.iter()) {
-                    projection_ext += *coeff * *packed;
-                }
-                push(&mut witness, projection_ext);
-                let projection_limbs =
-                    <SP1ExtensionField as AbstractExtensionField<SP1Field>>::as_base_slice(
-                        &projection_ext,
-                    );
-                for limb in projection_limbs {
-                    push(&mut witness, ext_from_base_field(*limb));
-                }
-                let signed_projection = centered_sp1_i64(projection_limbs[0]);
-                let bits = decompose_signed_bits(signed_projection, ORBWEAVER_JL_SIGNED_BITS)
-                    .map_err(GermError::AadpConstraintUnsatisfied)?;
-                for bit in bits {
-                    push(&mut witness, ext_from_u32(bit as u32));
-                }
+        let mut jl_norm_sum = 0u64;
+        for row in &orbweaver_data.jl_rows {
+            let row_weights = row
+                .iter()
+                .map(|coeff| match *coeff {
+                    1 => SP1Field::one(),
+                    -1 => -SP1Field::one(),
+                    _ => SP1Field::zero(),
+                })
+                .collect::<Vec<_>>();
+            let row_multipliers =
+                pack_scalar_weights_to_extension_multipliers(row_weights.as_slice());
+            let mut projection_ext = ext_zero();
+            for (packed, coeff) in all_proof_blocks.iter().zip(row_multipliers.iter()) {
+                projection_ext += *coeff * *packed;
             }
+            let projection_limbs =
+                <SP1ExtensionField as AbstractExtensionField<SP1Field>>::as_base_slice(
+                    &projection_ext,
+                );
+            for limb in projection_limbs {
+                push(&mut witness, ext_from_base_field(*limb));
+            }
+            let square = projection_limbs[0] * projection_limbs[0];
+            push(&mut witness, ext_from_base_field(square));
+            jl_norm_sum = jl_norm_sum
+                .checked_add(u64::from(square.as_canonical_u32()))
+                .ok_or_else(|| {
+                    GermError::AadpConstraintUnsatisfied(
+                        "orbweaver JL squared norm overflow".to_string(),
+                    )
+                })?;
+        }
+        let bits = decompose_unsigned_bits(jl_norm_sum, ORBWEAVER_JL_NORM_BITS)
+            .map_err(GermError::AadpConstraintUnsatisfied)?;
+        for bit in bits {
+            push(&mut witness, ext_from_u32(bit as u32));
         }
     }
     let delta = opening_lhs_product - opening_rhs_product;
@@ -3527,6 +3480,16 @@ fn linear_form_sub_forms(
     let mut terms = lhs.terms.clone();
     terms.extend(rhs.terms.iter().map(|(idx, coeff)| (*idx, -*coeff)));
     AadpLinearForm { constant: lhs.constant - rhs.constant, terms }
+}
+
+fn linear_form_scale(
+    form: &AadpLinearForm<SP1ExtensionField>,
+    scale: SP1ExtensionField,
+) -> AadpLinearForm<SP1ExtensionField> {
+    AadpLinearForm {
+        constant: form.constant * scale,
+        terms: form.terms.iter().map(|(idx, coeff)| (*idx, *coeff * scale)).collect(),
+    }
 }
 
 fn add_mul_equals_var(
@@ -4290,37 +4253,33 @@ fn bytes_to_extension(bytes: &[u8]) -> SP1ExtensionField {
     state
 }
 
-fn derive_orbweaver_jl_rows(seed: &[u8; 32], coords_per_terminal: usize) -> Vec<Vec<Vec<i8>>> {
-    let mut out =
-        vec![vec![vec![0i8; coords_per_terminal]; ORBWEAVER_JL_PROJECTIONS_PER_TERMINAL]; 4];
-    for (terminal_idx, terminal_rows) in out.iter_mut().enumerate() {
-        for (row_idx, row) in terminal_rows.iter_mut().enumerate() {
-            let mut filled = 0usize;
-            let mut block = 0u32;
-            while filled < row.len() {
-                let mut h = Sha256::new();
-                h.update(b"sp1-germ/orbweaver-jl-row/v1");
-                h.update(seed);
-                h.update((terminal_idx as u32).to_le_bytes());
-                h.update((row_idx as u32).to_le_bytes());
-                h.update(block.to_le_bytes());
-                let digest = h.finalize();
-                for byte in digest {
-                    if filled >= row.len() {
-                        break;
-                    }
-                    row[filled] = match byte % 5 {
-                        0 => -1,
-                        1 => 1,
-                        _ => 0,
-                    };
-                    filled += 1;
+fn derive_orbweaver_jl_rows(seed: &[u8; 32], coords_total: usize) -> Vec<Vec<i8>> {
+    let mut out = vec![vec![0i8; coords_total]; ORBWEAVER_JL_TOTAL_PROJECTIONS];
+    for (row_idx, row) in out.iter_mut().enumerate() {
+        let mut filled = 0usize;
+        let mut block = 0u32;
+        while filled < row.len() {
+            let mut h = Sha256::new();
+            h.update(b"sp1-germ/orbweaver-jl-row/v2");
+            h.update(seed);
+            h.update((row_idx as u32).to_le_bytes());
+            h.update(block.to_le_bytes());
+            let digest = h.finalize();
+            for byte in digest {
+                if filled >= row.len() {
+                    break;
                 }
-                block = block.wrapping_add(1);
+                row[filled] = match byte % 5 {
+                    0 => -1,
+                    1 => 1,
+                    _ => 0,
+                };
+                filled += 1;
             }
-            if row.iter().all(|coeff| *coeff == 0) && !row.is_empty() {
-                row[0] = 1;
-            }
+            block = block.wrapping_add(1);
+        }
+        if row.iter().all(|coeff| *coeff == 0) && !row.is_empty() {
+            row[0] = 1;
         }
     }
     out
@@ -4388,14 +4347,6 @@ fn ext_from_u32(x: u32) -> SP1ExtensionField {
     ])
 }
 
-fn ext_from_i64(x: i64) -> SP1ExtensionField {
-    if x >= 0 {
-        ext_from_u32(x as u32)
-    } else {
-        -ext_from_u32((-x) as u32)
-    }
-}
-
 fn ext_from_base_field(x: SP1Field) -> SP1ExtensionField {
     SP1ExtensionField::from_base_slice(&[x, SP1Field::zero(), SP1Field::zero(), SP1Field::zero()])
 }
@@ -4454,37 +4405,23 @@ fn ext_one() -> SP1ExtensionField {
     ])
 }
 
-fn centered_sp1_i64(value: SP1Field) -> i64 {
-    let canonical = i64::from(value.as_canonical_u32());
-    let modulus = i64::from(SP1Field::ORDER_U32);
-    let half = modulus / 2;
-    if canonical <= half {
-        canonical
-    } else {
-        canonical - modulus
+fn decompose_unsigned_bits(value: u64, bits: usize) -> Result<Vec<u8>, String> {
+    if bits == 0 {
+        return Err("unsigned decomposition requires at least 1 bit".to_string());
     }
-}
-
-fn decompose_signed_bits(value: i64, bits: usize) -> Result<Vec<u8>, String> {
-    if bits < 2 {
-        return Err("signed decomposition requires at least 2 bits".to_string());
-    }
-    let min = -(1i64 << (bits - 1));
-    let max = (1i64 << (bits - 1)) - 1;
-    if value < min || value > max {
+    if bits < 64 && value >= (1u64 << bits) {
         return Err(format!(
-            "signed decomposition overflow: value={} range=[{},{}]",
-            value, min, max
+            "unsigned decomposition overflow: value={} range=[0,{})",
+            value,
+            1u64 << bits
         ));
     }
-    let sign = if value < 0 { 1u8 } else { 0u8 };
-    let mut unsigned = if value < 0 { value + (1i64 << (bits - 1)) } else { value } as u64;
     let mut out = Vec::with_capacity(bits);
-    for _ in 0..(bits - 1) {
-        out.push((unsigned & 1) as u8);
-        unsigned >>= 1;
+    let mut rem = value;
+    for _ in 0..bits {
+        out.push((rem & 1) as u8);
+        rem >>= 1;
     }
-    out.push(sign);
     Ok(out)
 }
 
