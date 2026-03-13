@@ -3,8 +3,7 @@ use sha2::Digest;
 use slop_algebra::{AbstractExtensionField, AbstractField};
 use sp1_primitives::{SP1ExtensionField, SP1Field};
 
-pub type Sp1PackageCommitment =
-    [[SP1ExtensionField; PACKAGE_AJTAI_RING_DIM]; PACKAGE_AJTAI_ROWS];
+pub type Sp1PackageCommitment = [[SP1ExtensionField; PACKAGE_AJTAI_RING_DIM]; PACKAGE_AJTAI_ROWS];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum GermVerifierStage {
@@ -308,6 +307,14 @@ pub struct Sp1MulSumcheckProof {
     pub opening: Sp1MulTerm,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Sp1MulTerminalOpeningProofs {
+    pub a: Vec<u8>,
+    pub b: Vec<u8>,
+    pub c: Vec<u8>,
+    pub d: Vec<u8>,
+}
+
 impl Default for Sp1MulSumcheckProof {
     fn default() -> Self {
         Self {
@@ -369,6 +376,11 @@ pub struct Sp1GermBundle {
     /// In the current SP1-native GERM layer this is the canonical encoding of
     /// `Sp1MulSumcheckProof`.
     pub pi_mul: Vec<u8>,
+    /// Proof bytes for the 4 terminal linear openings of the multiplicative basis.
+    ///
+    /// These are intentionally separate from `pi_mul`: the sumcheck transcript stays compressed,
+    /// while terminal openings can be upgraded independently to a compact opening-layer proof.
+    pub pi_mul_terminal_openings: Sp1MulTerminalOpeningProofs,
     /// Binding tag checked by `verify_lin`.
     pub lin_binding_tag: [u8; 32],
     /// Binding tag checked by `verify_mul`.
@@ -423,6 +435,7 @@ impl Sp1GermBundle {
             mul_terms,
             pi_lin,
             pi_mul,
+            pi_mul_terminal_openings: Sp1MulTerminalOpeningProofs::default(),
             lin_binding_tag: [0u8; 32],
             mul_binding_tag: [0u8; 32],
         }

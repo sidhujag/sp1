@@ -1,13 +1,18 @@
 use rand::{rngs::OsRng, rngs::StdRng, RngCore, SeedableRng};
 use sha2::{Digest, Sha256};
 use sp1_germ::{
-    arm_germ_aadp_template, materialize_transcript_bound_germ_aadp_witness, AadpField,
-    ArmedGermAadpCiphertext, GermArmCapsule, GermPublicValues, GermResidualPlan, Sp1AadpField,
-    TranscriptBoundSp1GermProofObject,
+    arm_germ_aadp_template, arm_transcript_bound_germ_aadp_template_with_orbweaver_terminal_openings,
+    extension_terminal_openings_l_inf_u32, generate_local_dev_srs,
+    materialize_transcript_bound_germ_aadp_witness,
+    materialize_transcript_bound_germ_aadp_witness_with_orbweaver_terminal_openings, read_srs_from_file,
+    AadpField, GermArmCapsule, GermPublicValues, GermResidualPlan, OrbweaverOpeningSrs,
+    Sp1AadpField, TranscriptBoundSp1GermProofObject,
 };
 use sp1_prover::{
     germ_bridge::{
-        build_sp1_germ_bridge_from_recursion_proof, build_sp1_germ_proof_object_from_recursion_proof,
+        build_sp1_germ_bridge_from_recursion_proof,
+        build_sp1_germ_proof_object_from_recursion_proof,
+        build_sp1_germ_proof_object_from_recursion_proof_with_orbweaver_terminal_openings,
         sp1_germ_residual_plan, sp1_germ_schedule_descriptor_digest,
     },
 };
@@ -55,10 +60,13 @@ struct ArmPackage {
     residual_plan: GermResidualPlan,
     capsule: GermArmCapsule,
     key: Sp1AadpField,
-    armed: ArmedGermAadpCiphertext,
 }
 
-fn arm_before_proof(elf: &Elf, input_n: u32, vk_bytes: &[u8]) -> ArmPackage {
+fn build_arm_context(
+    elf: &Elf,
+    input_n: u32,
+    vk_bytes: &[u8],
+) -> ArmPackage {
     let statement_digest = {
         let mut h = Sha256::new();
         h.update(b"sp1-germ/statement/v1");
@@ -87,22 +95,10 @@ fn arm_before_proof(elf: &Elf, input_n: u32, vk_bytes: &[u8]) -> ArmPackage {
     };
     let residual_plan = sp1_germ_residual_plan().expect("derive SP1 GERM residual plan");
     let capsule = public_values.arm_capsule(&residual_plan);
-    let mut encryption_seed = [0u8; 32];
-    OsRng.fill_bytes(&mut encryption_seed);
     let mut key_bytes = [0u8; 16];
     OsRng.fill_bytes(&mut key_bytes);
     let key = <Sp1AadpField as AadpField>::from_u128(u128::from_le_bytes(key_bytes));
-    let mut rng = StdRng::from_seed(encryption_seed);
-    let armed = arm_germ_aadp_template(&capsule, &residual_plan, key, &mut rng)
-        .expect("arm pre-proof GERM/AADP template");
-
-    ArmPackage {
-        public_values,
-        residual_plan,
-        capsule,
-        key,
-        armed,
-    }
+    ArmPackage { public_values, residual_plan, capsule, key }
 }
 
 fn sumcheck_nvars(total_checks: usize) -> usize {
@@ -113,6 +109,14 @@ fn sumcheck_nvars(total_checks: usize) -> usize {
     }
 }
 
+fn maybe_load_orbweaver_srs(required_width: usize) -> Option<OrbweaverOpeningSrs> {
+    if std::env::var_os("SP1_GERM_USE_LOCAL_ORBWEAVER_SRS").is_some() {
+        return Some(generate_local_dev_srs(required_width));
+    }
+    let path = std::env::var_os("SP1_GERM_ORBWEAVER_SRS")?;
+    Some(read_srs_from_file(std::path::Path::new(&path), required_width).expect("load Orbweaver opening SRS"))
+}
+
 #[tokio::main]
 async fn main() {
     utils::setup_logger();
@@ -120,18 +124,23 @@ async fn main() {
     log_stage("start", &started);
 
     let n = 500u32;
+    let vk_probe_client = ProverClient::from_env().await;
+    log_stage("client-ready", &started);
+    let pk = vk_probe_client.setup(ELF).await.expect("setup");
+    log_stage("setup-ready", &started);
+    let vk_bytes = bincode::serialize(pk.verifying_key()).expect("serialize vk");
+    let required_orbweaver_width =
+        (1usize << usize::from(sp1_germ_residual_plan().expect("derive SP1 GERM residual plan").sumcheck_rounds))
+            * 16;
+    let orbweaver_srs = maybe_load_orbweaver_srs(required_orbweaver_width);
 
-    // Setup and ARM happen before proof generation.
+    // Setup happens before proof generation; the exact Orbweaver AADP relation is transcript-bound.
     let mut stdin = SP1Stdin::new();
     stdin.write(&n);
     log_stage("stdin-ready", &started);
-    let client = ProverClient::from_env().await;
-    log_stage("client-ready", &started);
-    let pk = client.setup(ELF).await.expect("setup");
-    log_stage("setup-ready", &started);
-    let vk_bytes = bincode::serialize(pk.verifying_key()).expect("serialize vk");
-    let arm_pkg = arm_before_proof(&ELF, n, &vk_bytes);
-    log_stage("arm-ready-before-proof", &started);
+    let client = vk_probe_client;
+    let arm_pkg = build_arm_context(&ELF, n, &vk_bytes);
+    log_stage("arm-context-ready", &started);
 
     // PROVE phase.
     let proof = client
@@ -158,33 +167,74 @@ async fn main() {
     );
     log_stage("bridge-built", &started);
 
-    let (proof_object, commitment_root) =
+    let (proof_object, commitment_root) = if let Some(srs) = orbweaver_srs.as_ref() {
+        build_sp1_germ_proof_object_from_recursion_proof_with_orbweaver_terminal_openings(
+            recursion_proof,
+            &arm_pkg.capsule,
+            srs,
+        )
+        .expect("build SP1 GERM proof object with Orbweaver terminal openings")
+    } else {
         build_sp1_germ_proof_object_from_recursion_proof(recursion_proof, &arm_pkg.capsule)
-            .expect("build SP1 GERM proof object");
+            .expect("build SP1 GERM proof object")
+    };
     let transcript_bound = TranscriptBoundSp1GermProofObject::new(proof_object, commitment_root);
     log_stage("germ-verified", &started);
+    if orbweaver_srs.is_some() {
+        let pi_norm =
+            extension_terminal_openings_l_inf_u32(&transcript_bound.proof_object.pi_mul_terminal_openings)
+                .expect("measure Orbweaver terminal opening norm");
+        println!("[germ-arm-bridge] orbweaver_terminal_opening_linf_u32={pi_norm}");
+    }
 
-    let decrypt_witness = materialize_transcript_bound_germ_aadp_witness(
-        &arm_pkg.armed.template,
-        &arm_pkg.capsule,
-        &transcript_bound,
-    )
-    .expect("materialize post-proof decrypt witness");
-    arm_pkg
-        .armed
+    let mut encryption_seed = [0u8; 32];
+    OsRng.fill_bytes(&mut encryption_seed);
+    let mut rng = StdRng::from_seed(encryption_seed);
+    let armed = if let Some(srs) = orbweaver_srs.as_ref() {
+        arm_transcript_bound_germ_aadp_template_with_orbweaver_terminal_openings(
+            &arm_pkg.capsule,
+            &arm_pkg.residual_plan,
+            &transcript_bound,
+            srs,
+            arm_pkg.key,
+            &mut rng,
+        )
+        .expect("arm transcript-bound GERM/AADP template with Orbweaver terminal openings")
+    } else {
+        arm_germ_aadp_template(&arm_pkg.capsule, &arm_pkg.residual_plan, arm_pkg.key, &mut rng)
+            .expect("arm GERM/AADP template")
+    };
+    log_stage("aadp-armed", &started);
+
+    let decrypt_witness = if let Some(srs) = orbweaver_srs.as_ref() {
+        materialize_transcript_bound_germ_aadp_witness_with_orbweaver_terminal_openings(
+            &armed.template,
+            &arm_pkg.capsule,
+            &transcript_bound,
+            srs,
+        )
+        .expect("materialize post-proof decrypt witness with Orbweaver terminal openings")
+    } else {
+        materialize_transcript_bound_germ_aadp_witness(
+            &armed.template,
+            &arm_pkg.capsule,
+            &transcript_bound,
+        )
+        .expect("materialize post-proof decrypt witness")
+    };
+    armed
         .template
         .check_witness(&decrypt_witness)
         .expect("aadp witness satisfies compiled constraints");
     log_stage("aadp-constraints-armed", &started);
 
-    let recovered = arm_pkg.armed.decap_checked(&decrypt_witness).expect("aadp decap");
+    let recovered = armed.decap_checked(&decrypt_witness).expect("aadp decap");
     assert_eq!(recovered, arm_pkg.key);
 
     // Negative check: witness tamper must fail checked decap.
     let mut tampered_witness = decrypt_witness.witness.clone();
     tampered_witness[0] += <Sp1AadpField as AadpField>::one();
-    let tampered_decap =
-        arm_pkg.armed.decap_checked(&sp1_germ::GermAadpWitness { witness: tampered_witness });
+    let tampered_decap = armed.decap_checked(&sp1_germ::GermAadpWitness { witness: tampered_witness });
     assert!(
         tampered_decap.is_err(),
         "tampered witness unexpectedly passed checked decap"
@@ -194,14 +244,24 @@ async fn main() {
     // Without access to arm-time key/ciphertext generation, attacker mutations should not unlock K.
     let mut tampered_proof_object = transcript_bound.proof_object.clone();
     tampered_proof_object.pi_lin[0] ^= 0x01;
-    let tampered_compile = materialize_transcript_bound_germ_aadp_witness(
-        &arm_pkg.armed.template,
-        &arm_pkg.capsule,
-        &TranscriptBoundSp1GermProofObject::new(
-            tampered_proof_object,
-            transcript_bound.commitment_root,
-        ),
+    let tampered_transcript = TranscriptBoundSp1GermProofObject::new(
+        tampered_proof_object,
+        transcript_bound.commitment_root,
     );
+    let tampered_compile = if let Some(srs) = orbweaver_srs.as_ref() {
+        materialize_transcript_bound_germ_aadp_witness_with_orbweaver_terminal_openings(
+            &armed.template,
+            &arm_pkg.capsule,
+            &tampered_transcript,
+            srs,
+        )
+    } else {
+        materialize_transcript_bound_germ_aadp_witness(
+            &armed.template,
+            &arm_pkg.capsule,
+            &tampered_transcript,
+        )
+    };
     assert!(
         tampered_compile.is_err(),
         "tampered bundle unexpectedly compiled against fixed armed relation"
@@ -211,15 +271,26 @@ async fn main() {
     // This should not recover the original arm-time key.
     let mut rebinding_attack_proof_object = transcript_bound.proof_object.clone();
     rebinding_attack_proof_object.mul_terms[0].d += <Sp1AadpField as AadpField>::one();
-    if let Ok(rebound_witness) = materialize_transcript_bound_germ_aadp_witness(
-            &arm_pkg.armed.template,
+    let rebound_transcript = TranscriptBoundSp1GermProofObject::new(
+        rebinding_attack_proof_object,
+        transcript_bound.commitment_root,
+    );
+    let rebound_compile = if let Some(srs) = orbweaver_srs.as_ref() {
+        materialize_transcript_bound_germ_aadp_witness_with_orbweaver_terminal_openings(
+            &armed.template,
             &arm_pkg.capsule,
-            &TranscriptBoundSp1GermProofObject::new(
-                rebinding_attack_proof_object,
-                transcript_bound.commitment_root,
-            ),
-        ) {
-            let rebound_try = arm_pkg.armed.decap_checked(&rebound_witness);
+            &rebound_transcript,
+            srs,
+        )
+    } else {
+        materialize_transcript_bound_germ_aadp_witness(
+            &armed.template,
+            &arm_pkg.capsule,
+            &rebound_transcript,
+        )
+    };
+    if let Ok(rebound_witness) = rebound_compile {
+            let rebound_try = armed.decap_checked(&rebound_witness);
             assert!(
                 !matches!(rebound_try, Ok(k) if k == arm_pkg.key),
                 "rebound attack unexpectedly recovered the original armed key"
@@ -229,7 +300,8 @@ async fn main() {
 
     let nvars = sumcheck_nvars(transcript_bound.proof_object.mul_terms.len());
     println!(
-        "ok: bridge_tables={} rlin_tables={} rmul_tables={} residual_plan_rounds={} lin_terms={} mul_terms={} sumcheck_nvars={} aadp_vars={} aadp_constraints={} lin_checks={} opening_checks={} mul_gates={}",
+        "ok: orbweaver_enabled={} bridge_tables={} rlin_tables={} rmul_tables={} residual_plan_rounds={} lin_terms={} mul_terms={} sumcheck_nvars={} aadp_vars={} aadp_constraints={} lin_checks={} opening_checks={} mul_gates={}",
+        orbweaver_srs.is_some(),
         bridge.tables.len(),
         bridge.manifest.rlin_tables.len(),
         bridge.manifest.rmul_tables.len(),
@@ -237,10 +309,10 @@ async fn main() {
         transcript_bound.proof_object.lin_terms.len(),
         transcript_bound.proof_object.mul_terms.len(),
         nvars,
-        arm_pkg.armed.template.cs.num_variables,
-        arm_pkg.armed.template.cs.constraints.len(),
-        arm_pkg.armed.template.stats.linear_round_checks,
-        arm_pkg.armed.template.stats.opening_checks,
-        arm_pkg.armed.template.stats.multiplication_gates
+        armed.template.cs.num_variables,
+        armed.template.cs.constraints.len(),
+        armed.template.stats.linear_round_checks,
+        armed.template.stats.opening_checks,
+        armed.template.stats.multiplication_gates
     );
 }

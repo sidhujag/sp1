@@ -2,8 +2,8 @@ use std::borrow::Borrow;
 
 use anyhow::{anyhow, Context, Result};
 use itertools::Itertools;
-use slop_air::BaseAir;
 use sha2::{Digest, Sha256};
+use slop_air::BaseAir;
 use slop_algebra::{AbstractExtensionField, AbstractField, Field, PrimeField32};
 use slop_challenger::{CanObserve, FieldChallenger, GrindingChallenger};
 use slop_multilinear::{
@@ -11,23 +11,23 @@ use slop_multilinear::{
 };
 use slop_sumcheck::partially_verify_sumcheck_proof;
 use sp1_germ::{
-    bind_bundle_to_capsule, compute_commitment_root, GermArmCapsule, GermResidualPlan,
-    GermVerifierStage, LinearResidualDescriptor, MultiplicativeResidualDescriptor,
+    bind_bundle_to_capsule, bind_bundle_to_capsule_with_orbweaver_terminal_openings,
+    compute_commitment_root, GermArmCapsule, GermResidualPlan, GermVerifierStage,
+    LinearResidualDescriptor, MultiplicativeResidualDescriptor, OrbweaverOpeningSrs,
     Sp1GermProofObject, Sp1LinTerm, Sp1MulTerm,
 };
 use sp1_hypercube::{
-    air::MachineAir, LogUpEvaluations, LogUpGkrVerifier, MachineRecord, SP1PcsProofInner, SP1RecursionProof,
-    ShardProof, PROOF_MAX_NUM_PVS,
+    air::MachineAir, LogUpEvaluations, LogUpGkrVerifier, MachineRecord, SP1PcsProofInner,
+    SP1RecursionProof, ShardProof, PROOF_MAX_NUM_PVS,
 };
 use sp1_primitives::{SP1ExtensionField, SP1Field, SP1GlobalContext};
 use sp1_recursion_executor::RecursionPublicValues;
 
 use crate::{
     components::{RecursionSC, SP1ProverComponents},
-    shapes::{DEFAULT_ARITY, SP1RecursionProofShape},
+    shapes::{SP1RecursionProofShape, DEFAULT_ARITY},
     utils::is_recursion_public_values_valid,
-    CpuSP1ProverComponents,
-    SP1_CIRCUIT_VERSION,
+    CpuSP1ProverComponents, SP1_CIRCUIT_VERSION,
 };
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -404,7 +404,8 @@ fn export_linear_residual_terms_from_recursion_proof(
         ));
     }
 
-    let recursion_public_values: &RecursionPublicValues<_> = shard_proof.public_values.as_slice().borrow();
+    let recursion_public_values: &RecursionPublicValues<_> =
+        shard_proof.public_values.as_slice().borrow();
 
     let mut challenger = verifier.challenger();
     vk.observe_into(&mut challenger);
@@ -414,7 +415,8 @@ fn export_linear_residual_terms_from_recursion_proof(
     }
     challenger.observe(shard_proof.main_commitment);
 
-    let shard_chip_names = shard_proof.opened_values.chips.keys().cloned().collect::<std::collections::BTreeSet<_>>();
+    let shard_chip_names =
+        shard_proof.opened_values.chips.keys().cloned().collect::<std::collections::BTreeSet<_>>();
     challenger.observe(SP1Field::from_canonical_usize(shard_chip_names.len()));
 
     let mut heights = std::collections::BTreeMap::new();
@@ -423,10 +425,8 @@ fn export_linear_residual_terms_from_recursion_proof(
         if chip_values.degree.len() != max_log_row_count + 1 || chip_values.degree.len() >= 30 {
             return Err(anyhow!("invalid degree shape for chip {name}"));
         }
-        let acc = chip_values
-            .degree
-            .iter()
-            .fold(SP1Field::zero(), |acc, &x| x + SP1Field::two() * acc);
+        let acc =
+            chip_values.degree.iter().fold(SP1Field::zero(), |acc, &x| x + SP1Field::two() * acc);
         heights.insert(name.clone(), acc);
         degrees.insert(name.clone(), chip_values.degree.clone());
         challenger.observe(acc);
@@ -436,8 +436,10 @@ fn export_linear_residual_terms_from_recursion_proof(
         }
     }
 
-    let machine_chip_names =
-        machine_chips.iter().map(|chip| chip.name().to_string()).collect::<std::collections::BTreeSet<_>>();
+    let machine_chip_names = machine_chips
+        .iter()
+        .map(|chip| chip.name().to_string())
+        .collect::<std::collections::BTreeSet<_>>();
     let preprocessed_chips: Vec<_> =
         machine_chips.iter().filter(|chip| chip.preprocessed_width() != 0).cloned().collect();
 
@@ -571,12 +573,14 @@ fn export_linear_residual_terms_from_recursion_proof(
                 ));
             }
             LinearResidualDescriptor::PublicValuesPadding { start_idx, count } => {
-                for value in shard_proof.public_values[start_idx..start_idx + count].iter().copied() {
+                for value in shard_proof.public_values[start_idx..start_idx + count].iter().copied()
+                {
                     push_linear_residual(&mut linear_terms, base_to_ext(value));
                 }
             }
             LinearResidualDescriptor::RecursionPublicValuesDigest => {
-                if !is_recursion_public_values_valid(shard_proof.public_values.as_slice().borrow()) {
+                if !is_recursion_public_values_valid(shard_proof.public_values.as_slice().borrow())
+                {
                     push_linear_residual(&mut linear_terms, ext_one());
                 } else {
                     push_linear_residual(&mut linear_terms, ext_zero());
@@ -622,15 +626,14 @@ fn export_multiplicative_residual_terms_from_recursion_proof(
     }
     challenger.observe(shard_proof.main_commitment);
 
-    let shard_chip_names = shard_proof.opened_values.chips.keys().cloned().collect::<std::collections::BTreeSet<_>>();
+    let shard_chip_names =
+        shard_proof.opened_values.chips.keys().cloned().collect::<std::collections::BTreeSet<_>>();
     challenger.observe(SP1Field::from_canonical_usize(shard_chip_names.len()));
 
     let mut degrees = std::collections::BTreeMap::new();
     for (name, chip_values) in &shard_proof.opened_values.chips {
-        let acc = chip_values
-            .degree
-            .iter()
-            .fold(SP1Field::zero(), |acc, &x| x + SP1Field::two() * acc);
+        let acc =
+            chip_values.degree.iter().fold(SP1Field::zero(), |acc, &x| x + SP1Field::two() * acc);
         degrees.insert(name.clone(), chip_values.degree.clone());
         challenger.observe(acc);
         challenger.observe(SP1Field::from_canonical_usize(name.len()));
@@ -658,13 +661,17 @@ fn export_multiplicative_residual_terms_from_recursion_proof(
             .map(|i| i.values.len() + 1)
             .max()
             .unwrap_or(1);
-        let max_interaction_kinds_values =
-            sp1_hypercube::prover::Record::<SP1GlobalContext, RecursionSC>::interactions_in_public_values()
-                .iter()
-                .map(|kind| kind.num_values() + 1)
-                .max()
-                .unwrap_or(1);
-        std::cmp::max(max_interaction_arity, max_interaction_kinds_values).next_power_of_two().ilog2()
+        let max_interaction_kinds_values = sp1_hypercube::prover::Record::<
+            SP1GlobalContext,
+            RecursionSC,
+        >::interactions_in_public_values()
+        .iter()
+        .map(|kind| kind.num_values() + 1)
+        .max()
+        .unwrap_or(1);
+        std::cmp::max(max_interaction_arity, max_interaction_kinds_values)
+            .next_power_of_two()
+            .ilog2()
     };
     let beta_seed = (0..beta_seed_dim)
         .map(|_| challenger.sample_ext_element::<SP1ExtensionField>())
@@ -732,9 +739,8 @@ fn export_multiplicative_residual_terms_from_recursion_proof(
         .map_err(|err| anyhow!("replay logup sumcheck round {}: {err}", round_idx))?;
         let (point, final_eval) = round_proof.sumcheck_proof.point_and_eval.clone();
         let eq_eval = Mle::full_lagrange_eval(&point, &eval_point);
-        let numerator_sumcheck_eval =
-            round_proof.numerator_0 * round_proof.denominator_1
-                + round_proof.numerator_1 * round_proof.denominator_0;
+        let numerator_sumcheck_eval = round_proof.numerator_0 * round_proof.denominator_1
+            + round_proof.numerator_1 * round_proof.denominator_0;
         let denominator_sumcheck_eval = round_proof.denominator_0 * round_proof.denominator_1;
         let combined = numerator_sumcheck_eval * lambda + denominator_sumcheck_eval;
         round_final_evals.push((eq_eval, combined, final_eval));
@@ -779,8 +785,10 @@ fn export_multiplicative_residual_terms_from_recursion_proof(
                 challenger.observe_ext_element(value);
             }
             let geq_eval = full_geq(threshold, &point_extended);
-            let sp1_hypercube::ChipEvaluation { main_trace_evaluations, preprocessed_trace_evaluations } =
-                openings;
+            let sp1_hypercube::ChipEvaluation {
+                main_trace_evaluations,
+                preprocessed_trace_evaluations,
+            } = openings;
             for (interaction, is_send) in chip
                 .sends()
                 .iter()
@@ -793,11 +801,15 @@ fn export_multiplicative_residual_terms_from_recursion_proof(
                     alpha,
                     betas.as_slice(),
                 );
-                let padding_trace_opening =
-                    MleEval::from(vec![SP1ExtensionField::zero(); main_trace_evaluations.num_polynomials()]);
-                let padding_preprocessed_opening = preprocessed_trace_evaluations
-                    .as_ref()
-                    .map(|eval| MleEval::from(vec![SP1ExtensionField::zero(); eval.num_polynomials()]));
+                let padding_trace_opening = MleEval::from(vec![
+                    SP1ExtensionField::zero();
+                    main_trace_evaluations
+                        .num_polynomials()
+                ]);
+                let padding_preprocessed_opening =
+                    preprocessed_trace_evaluations.as_ref().map(|eval| {
+                        MleEval::from(vec![SP1ExtensionField::zero(); eval.num_polynomials()])
+                    });
                 let (padding_numerator, padding_denominator) = interaction.eval(
                     padding_preprocessed_opening.as_ref(),
                     &padding_trace_opening,
@@ -812,9 +824,12 @@ fn export_multiplicative_residual_terms_from_recursion_proof(
                 denominator_values.push(denominator_eval);
             }
         }
-        numerator_values.resize(1usize << (interaction_point.dimension() as usize), SP1ExtensionField::zero());
-        denominator_values.resize(1usize << (interaction_point.dimension() as usize), SP1ExtensionField::one());
-        let expected_numerator_eval = Mle::from(numerator_values).blocking_eval_at(&interaction_point)[0];
+        numerator_values
+            .resize(1usize << (interaction_point.dimension() as usize), SP1ExtensionField::zero());
+        denominator_values
+            .resize(1usize << (interaction_point.dimension() as usize), SP1ExtensionField::one());
+        let expected_numerator_eval =
+            Mle::from(numerator_values).blocking_eval_at(&interaction_point)[0];
         let expected_denominator_eval =
             Mle::from(denominator_values).blocking_eval_at(&interaction_point)[0];
         final_num_residual = numerator_eval - expected_numerator_eval;
@@ -834,12 +849,17 @@ fn export_multiplicative_residual_terms_from_recursion_proof(
                     .chips
                     .get(&chip_name)
                     .ok_or_else(|| anyhow!("missing chip openings for {}", chip_name))?;
-                let bit = *openings
-                    .degree
-                    .get(bit_idx)
-                    .ok_or_else(|| anyhow!("degree bit idx {} out of range for {}", bit_idx, chip_name))?;
+                let bit = *openings.degree.get(bit_idx).ok_or_else(|| {
+                    anyhow!("degree bit idx {} out of range for {}", bit_idx, chip_name)
+                })?;
                 let bit_ext = base_to_ext(bit);
-                push_mul_residual(&mut mul_terms, bit_ext, bit_ext - ext_one(), ext_zero(), ext_one());
+                push_mul_residual(
+                    &mut mul_terms,
+                    bit_ext,
+                    bit_ext - ext_one(),
+                    ext_zero(),
+                    ext_one(),
+                );
             }
             MultiplicativeResidualDescriptor::DegreeHeightProduct { chip_name, bit_idx } => {
                 let openings = shard_proof
@@ -848,11 +868,16 @@ fn export_multiplicative_residual_terms_from_recursion_proof(
                     .get(&chip_name)
                     .ok_or_else(|| anyhow!("missing chip openings for {}", chip_name))?;
                 let first = openings.degree.first().copied().unwrap_or(SP1Field::zero());
-                let bit = *openings
-                    .degree
-                    .get(bit_idx)
-                    .ok_or_else(|| anyhow!("degree bit idx {} out of range for {}", bit_idx, chip_name))?;
-                push_mul_residual(&mut mul_terms, base_to_ext(bit), base_to_ext(first), ext_zero(), ext_one());
+                let bit = *openings.degree.get(bit_idx).ok_or_else(|| {
+                    anyhow!("degree bit idx {} out of range for {}", bit_idx, chip_name)
+                })?;
+                push_mul_residual(
+                    &mut mul_terms,
+                    base_to_ext(bit),
+                    base_to_ext(first),
+                    ext_zero(),
+                    ext_one(),
+                );
             }
             MultiplicativeResidualDescriptor::GkrPowWitness => {
                 if pow_residual {
@@ -876,9 +901,9 @@ fn export_multiplicative_residual_terms_from_recursion_proof(
                     .as_slice()
                     .get(index)
                     .ok_or_else(|| anyhow!("denominator inverse idx {} out of range", index))?;
-                let inv = *denominator_inverses
-                    .get(index)
-                    .ok_or_else(|| anyhow!("denominator inverse cache idx {} out of range", index))?;
+                let inv = *denominator_inverses.get(index).ok_or_else(|| {
+                    anyhow!("denominator inverse cache idx {} out of range", index)
+                })?;
                 push_mul_residual(&mut mul_terms, d, inv, ext_one(), ext_one());
             }
             MultiplicativeResidualDescriptor::GkrRoundClaimedSum { round_idx } => {
@@ -900,10 +925,22 @@ fn export_multiplicative_residual_terms_from_recursion_proof(
                 push_mul_residual(&mut mul_terms, residual, ext_one(), ext_zero(), ext_one());
             }
             MultiplicativeResidualDescriptor::GkrFinalNumeratorEval => {
-                push_mul_residual(&mut mul_terms, final_num_residual, ext_one(), ext_zero(), ext_one());
+                push_mul_residual(
+                    &mut mul_terms,
+                    final_num_residual,
+                    ext_one(),
+                    ext_zero(),
+                    ext_one(),
+                );
             }
             MultiplicativeResidualDescriptor::GkrFinalDenominatorEval => {
-                push_mul_residual(&mut mul_terms, final_den_residual, ext_one(), ext_zero(), ext_one());
+                push_mul_residual(
+                    &mut mul_terms,
+                    final_den_residual,
+                    ext_one(),
+                    ext_zero(),
+                    ext_one(),
+                );
             }
         }
     }
@@ -1100,10 +1137,8 @@ pub fn build_sp1_germ_proof_object_from_recursion_proof(
     // proof-object exporter derived from the actual recursion verifier equations.
     let mut lin_terms = export_linear_residual_terms_from_recursion_proof(proof)
         .context("export linear residual terms from recursion proof")?;
-    if let Some((idx, term)) = lin_terms
-        .iter()
-        .enumerate()
-        .find(|(_, term)| !is_zero_ext(&term.value))
+    if let Some((idx, term)) =
+        lin_terms.iter().enumerate().find(|(_, term)| !is_zero_ext(&term.value))
     {
         anyhow::bail!(
             "first exported linear residual is nonzero at index {}: {:?}",
@@ -1117,15 +1152,10 @@ pub fn build_sp1_germ_proof_object_from_recursion_proof(
 
     let mut mul_terms = export_multiplicative_residual_terms_from_recursion_proof(proof)
         .context("export multiplicative residual terms from recursion proof")?;
-    if let Some((idx, _term)) = mul_terms
-        .iter()
-        .enumerate()
-        .find(|(_, term)| (term.a * term.b) != (term.c * term.d))
+    if let Some((idx, _term)) =
+        mul_terms.iter().enumerate().find(|(_, term)| (term.a * term.b) != (term.c * term.d))
     {
-        anyhow::bail!(
-            "first exported multiplicative residual is nonzero at index {}",
-            idx
-        );
+        anyhow::bail!("first exported multiplicative residual is nonzero at index {}", idx);
     }
     if mul_terms.is_empty() {
         mul_terms.push(Sp1MulTerm::new(ext_zero(), ext_one(), ext_zero(), ext_one()));
@@ -1142,9 +1172,68 @@ pub fn build_sp1_germ_proof_object_from_recursion_proof(
         mul_terms.push(Sp1MulTerm::new(ext_zero(), ext_one(), ext_zero(), ext_one()));
     }
 
-    let mut proof_object = Sp1GermProofObject::new(shared_object, lin_terms, mul_terms, Vec::new(), Vec::new());
+    let mut proof_object =
+        Sp1GermProofObject::new(shared_object, lin_terms, mul_terms, Vec::new(), Vec::new());
     let (commitment_root, _) = bind_bundle_to_capsule(&mut proof_object, capsule)
         .map_err(|err| anyhow!("bind SP1 GERM proof object: {err}"))?;
+    let expected_commitment_root = compute_commitment_root(&proof_object.shared_object_commitment);
+    anyhow::ensure!(
+        expected_commitment_root == commitment_root,
+        "commitment root drift while exporting SP1 GERM proof object"
+    );
+    Ok((proof_object, commitment_root))
+}
+
+pub fn build_sp1_germ_proof_object_from_recursion_proof_with_orbweaver_terminal_openings(
+    proof: &SP1RecursionProof<SP1GlobalContext, SP1PcsProofInner>,
+    capsule: &GermArmCapsule,
+    srs: &OrbweaverOpeningSrs,
+) -> Result<(Sp1GermProofObject, [u8; 32])> {
+    let bridge = build_sp1_germ_bridge_from_recursion_proof(proof)?;
+    let shared_object = bincode::serialize(&bridge).context("serialize SP1 GERM bridge")?;
+
+    let mut lin_terms = export_linear_residual_terms_from_recursion_proof(proof)
+        .context("export linear residual terms from recursion proof")?;
+    if let Some((idx, term)) =
+        lin_terms.iter().enumerate().find(|(_, term)| !is_zero_ext(&term.value))
+    {
+        anyhow::bail!(
+            "first exported linear residual is nonzero at index {}: {:?}",
+            idx,
+            term.value
+        );
+    }
+    if lin_terms.is_empty() {
+        lin_terms.push(Sp1LinTerm::new(ext_one(), ext_zero()));
+    }
+
+    let mut mul_terms = export_multiplicative_residual_terms_from_recursion_proof(proof)
+        .context("export multiplicative residual terms from recursion proof")?;
+    if let Some((idx, _term)) =
+        mul_terms.iter().enumerate().find(|(_, term)| (term.a * term.b) != (term.c * term.d))
+    {
+        anyhow::bail!("first exported multiplicative residual is nonzero at index {}", idx);
+    }
+    if mul_terms.is_empty() {
+        mul_terms.push(Sp1MulTerm::new(ext_zero(), ext_one(), ext_zero(), ext_one()));
+    }
+    let target_mul_terms = 1usize << usize::from(sp1_germ_residual_plan()?.sumcheck_rounds);
+    if mul_terms.len() > target_mul_terms {
+        anyhow::bail!(
+            "SP1 GERM multiplicative term exporter exceeded fixed schedule: got {} > {}",
+            mul_terms.len(),
+            target_mul_terms
+        );
+    }
+    while mul_terms.len() < target_mul_terms {
+        mul_terms.push(Sp1MulTerm::new(ext_zero(), ext_one(), ext_zero(), ext_one()));
+    }
+
+    let mut proof_object =
+        Sp1GermProofObject::new(shared_object, lin_terms, mul_terms, Vec::new(), Vec::new());
+    let (commitment_root, _) =
+        bind_bundle_to_capsule_with_orbweaver_terminal_openings(&mut proof_object, capsule, srs)
+            .map_err(|err| anyhow!("bind SP1 GERM proof object with orbweaver openings: {err}"))?;
     let expected_commitment_root = compute_commitment_root(&proof_object.shared_object_commitment);
     anyhow::ensure!(
         expected_commitment_root == commitment_root,

@@ -174,8 +174,18 @@ impl<F: AadpField> AadpConstraintSystem<F> {
             ));
         }
         for (i, constraint) in self.constraints.iter().enumerate() {
-            if !constraint.eval_holds(witness)? {
-                return Err(format!("AADP witness violates constraint {i}"));
+            let a = constraint.a.eval(witness)?;
+            let b = constraint.b.eval(witness)?;
+            let c = constraint.c.eval(witness)?;
+            let d = constraint.d.eval(witness)?;
+            if a * b != c * d {
+                return Err(format!(
+                    "AADP witness violates constraint {i}: a={a:?} b={b:?} c={c:?} d={d:?} a_terms={} b_terms={} c_terms={} d_terms={}",
+                    constraint.a.terms.len(),
+                    constraint.b.terms.len(),
+                    constraint.c.terms.len(),
+                    constraint.d.terms.len(),
+                ));
             }
         }
         Ok(())
@@ -296,7 +306,10 @@ pub fn aadp_encrypt_scalar<F: AadpField, R: RngCore>(
     }
     let dim = cs.matrix_dim();
     let nn = dim.checked_mul(dim).ok_or_else(|| "AADP dim^2 overflow".to_string())?;
-    let mut matrices = vec![vec![F::zero(); nn]; cs.num_variables + 1];
+    let mut matrices: Vec<Vec<F>> = (0..(cs.num_variables + 1))
+        .into_par_iter()
+        .map(|_| vec![F::zero(); nn])
+        .collect();
     let mut l = vec![F::zero(); dim * 4];
     let mut r = vec![F::zero(); 4 * dim];
     let mut b_a = vec![F::zero(); nn];
@@ -355,9 +368,7 @@ fn add_linear_form_to_matrices<F: AadpField>(
     if matrices[0].len() != basis_matrix.len() {
         return Err("AADP basis matrix size mismatch".to_string());
     }
-    for (dst, src) in matrices[0].iter_mut().zip(basis_matrix.iter()) {
-        *dst += *src * form.constant;
-    }
+    add_scaled_basis_matrix(matrices[0].as_mut_slice(), form.constant, basis_matrix)?;
     for &(idx, coeff) in &form.terms {
         let dst = matrices
             .get_mut(idx + 1)
@@ -365,9 +376,7 @@ fn add_linear_form_to_matrices<F: AadpField>(
         if dst.len() != basis_matrix.len() {
             return Err(format!("AADP variable matrix size mismatch at idx={idx}"));
         }
-        for (d, s) in dst.iter_mut().zip(basis_matrix.iter()) {
-            *d += *s * coeff;
-        }
+        add_scaled_basis_matrix(dst.as_mut_slice(), coeff, basis_matrix)?;
     }
     Ok(())
 }
@@ -392,9 +401,7 @@ fn add_dense_linear_form_to_matrices<F: AadpField>(
         ));
     }
 
-    for (dst, src) in matrices[0].iter_mut().zip(basis_matrix.iter()) {
-        *dst += *src * constant;
-    }
+    add_scaled_basis_matrix(matrices[0].as_mut_slice(), constant, basis_matrix)?;
 
     matrices[1..].par_iter_mut().zip(coeffs.par_iter().copied()).for_each(|(dst, coeff)| {
         for (d, s) in dst.iter_mut().zip(basis_matrix.iter()) {
@@ -402,6 +409,23 @@ fn add_dense_linear_form_to_matrices<F: AadpField>(
         }
     });
 
+    Ok(())
+}
+
+fn add_scaled_basis_matrix<F: AadpField>(
+    dst: &mut [F],
+    scale: F,
+    basis_matrix: &[F],
+) -> Result<(), String> {
+    if dst.len() != basis_matrix.len() {
+        return Err("AADP basis matrix size mismatch".to_string());
+    }
+    if scale.is_zero() {
+        return Ok(());
+    }
+    dst.par_iter_mut().zip(basis_matrix.par_iter()).for_each(|(d, s)| {
+        *d += *s * scale;
+    });
     Ok(())
 }
 
@@ -427,24 +451,30 @@ fn basis_matrix_contributions_in_place<F: AadpField>(
     {
         return Err("AADP basis output size mismatch".to_string());
     }
-    for row in 0..dim {
-        let l0 = l[row * 4];
-        let l1 = l[row * 4 + 1];
-        let l2 = l[row * 4 + 2];
-        let l3 = l[row * 4 + 3];
-        for col in 0..dim {
-            let idx = row * dim + col;
-            let r0 = r[col];
-            let r1 = r[dim + col];
-            let r2 = r[2 * dim + col];
-            let r3 = r[3 * dim + col];
-            out_a[idx] = l0 * r0 + l3 * r3;
-            out_b[idx] = l1 * r1 + l2 * r2;
-            out_c[idx] = l0 * r1 + l2 * r3;
-            out_d[idx] = l1 * r0 + l3 * r2;
-            out_xi[idx] = -(l0 * r2) + (l1 * r3);
-        }
-    }
+    out_a
+        .par_chunks_mut(dim)
+        .zip(out_b.par_chunks_mut(dim))
+        .zip(out_c.par_chunks_mut(dim))
+        .zip(out_d.par_chunks_mut(dim))
+        .zip(out_xi.par_chunks_mut(dim))
+        .enumerate()
+        .for_each(|(row, ((((row_a, row_b), row_c), row_d), row_xi))| {
+            let l0 = l[row * 4];
+            let l1 = l[row * 4 + 1];
+            let l2 = l[row * 4 + 2];
+            let l3 = l[row * 4 + 3];
+            for col in 0..dim {
+                let r0 = r[col];
+                let r1 = r[dim + col];
+                let r2 = r[2 * dim + col];
+                let r3 = r[3 * dim + col];
+                row_a[col] = l0 * r0 + l3 * r3;
+                row_b[col] = l1 * r1 + l2 * r2;
+                row_c[col] = l0 * r1 + l2 * r3;
+                row_d[col] = l1 * r0 + l3 * r2;
+                row_xi[col] = -(l0 * r2) + (l1 * r3);
+            }
+        });
     Ok(())
 }
 

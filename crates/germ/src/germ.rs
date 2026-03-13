@@ -24,7 +24,15 @@ use crate::ajtai::{
 use crate::bundle::{
     GermArmCapsule, GermResidualPlan, GermVerifierStage, LinearResidualDescriptor,
     MultiplicativeResidualDescriptor, Sp1GermBundle, Sp1LinProof, Sp1LinTerm, Sp1MulSumcheckProof,
-    Sp1MulSumcheckRound, Sp1MulTerm, Sp1PackageCommitment, TranscriptBoundSp1GermProofObject,
+    Sp1MulSumcheckRound, Sp1MulTerm, Sp1MulTerminalOpeningProofs, Sp1PackageCommitment,
+    TranscriptBoundSp1GermProofObject,
+};
+use crate::koala_ring::{KoalaRing64, KOALA_RING64_DIM};
+use crate::orbweaver_opening::{
+    aggregate_scalar_image_form, aggregate_scalar_image_value,
+    build_aggregated_scalar_image_openings_from_mul_terms, decode_scalar_opening_proof, digest_srs,
+    scalar_ring_element_to_base_field, terminal_scalar_image_forms, terminal_scalar_image_values,
+    validate_srs, verify_aggregated_scalar_image_openings_from_mul_terms, OrbweaverOpeningSrs,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,8 +110,55 @@ enum CommitmentWitnessSlot {
     MultiplicativeField { term_idx: usize, field: MultiplicativeTermField },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AffineWitnessExpr {
+    var_idx: Option<usize>,
+    scale: SP1ExtensionField,
+    constant: SP1ExtensionField,
+}
+
+impl AffineWitnessExpr {
+    #[must_use]
+    fn constant(constant: SP1ExtensionField) -> Self {
+        Self { var_idx: None, scale: ext_zero(), constant }
+    }
+
+    #[must_use]
+    fn variable(var_idx: usize) -> Self {
+        Self { var_idx: Some(var_idx), scale: ext_one(), constant: ext_zero() }
+    }
+}
+
+fn add_scaled_affine_expr(
+    form: &mut AadpLinearForm<SP1ExtensionField>,
+    expr: AffineWitnessExpr,
+    scale: SP1ExtensionField,
+) {
+    form.constant += scale * expr.constant;
+    if let Some(var_idx) = expr.var_idx {
+        form.terms.push((var_idx, scale * expr.scale));
+    }
+}
+
 const MUL_SUMCHECK_ROUND_CHALLENGE_DOMAIN: &[u8] = b"sp1-germ/sumcheck-round-challenge/v3";
 const MUL_SUMCHECK_ROUND_STATE_DOMAIN: &[u8] = b"sp1-germ/sumcheck-round-state/v1";
+const ORBWEAVER_AGGREGATED_SCALAR_OPENINGS: usize = 4;
+const ORBWEAVER_SCALAR_IMAGE_COUNT: usize = 16;
+const ORBWEAVER_RING_COEFFS_PER_EXTENSION_BLOCK: usize = 4;
+const ORBWEAVER_JL_PROJECTIONS_PER_TERMINAL: usize = 8;
+const ORBWEAVER_JL_SIGNED_BITS: usize = 15;
+
+#[derive(Debug, Clone)]
+struct OrbweaverTranscriptTemplateData {
+    aggregated_vk_values: [SP1Field; ORBWEAVER_AGGREGATED_SCALAR_OPENINGS],
+    aggregated_output_multipliers:
+        [[SP1ExtensionField; 4]; ORBWEAVER_AGGREGATED_SCALAR_OPENINGS],
+    c_flat_field_multipliers: Vec<[SP1ExtensionField; 4]>,
+    lhs_block_multipliers: Vec<SP1ExtensionField>,
+    jl_rows: Vec<Vec<Vec<i8>>>,
+    proof_commitment: Sp1PackageCommitment,
+    proof_pi_len: usize,
+}
 
 #[derive(Debug, Clone)]
 struct CommitmentBindingLayout {
@@ -113,6 +168,7 @@ struct CommitmentBindingLayout {
     expected_mul_terms: usize,
     linear_coefficient_indices: Vec<Option<usize>>,
     linear_value_indices: Vec<usize>,
+    multiplicative_field_exprs: Vec<[AffineWitnessExpr; 4]>,
 }
 
 #[derive(Debug, Clone)]
@@ -122,6 +178,8 @@ pub struct GermAadpWitnessLayout {
     expected_mul_terms: usize,
     commitment_slots: Vec<CommitmentWitnessSlot>,
     linear_term_has_explicit_coefficient: Vec<bool>,
+    orbweaver_terminal_pi_len: usize,
+    orbweaver_aggregated_proof_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -190,6 +248,11 @@ pub enum GermError {
     SumcheckInterpolationDenominatorZero,
     InvalidResidualPlan(String),
     TranscriptShapeMismatch { which: &'static str, got: usize, expected: usize },
+    InvalidOrbweaverSrs(String),
+    MissingMulTerminalOpening(&'static str),
+    MalformedMulTerminalOpening { which: &'static str, msg: String },
+    MulTerminalOpeningMismatch(&'static str),
+    MulTerminalOpeningFailed { which: &'static str, msg: String },
     AadpConstraintUnsatisfied(String),
     TemplateCapsuleMismatch,
     AadpEncryptFailed(String),
@@ -227,6 +290,19 @@ impl core::fmt::Display for GermError {
             Self::InvalidResidualPlan(msg) => write!(f, "invalid residual plan: {msg}"),
             Self::TranscriptShapeMismatch { which, got, expected } => {
                 write!(f, "transcript shape mismatch for {which}: got={got} expected={expected}")
+            }
+            Self::InvalidOrbweaverSrs(msg) => write!(f, "invalid Orbweaver SRS: {msg}"),
+            Self::MissingMulTerminalOpening(which) => {
+                write!(f, "missing multiplicative terminal opening proof for {which}")
+            }
+            Self::MalformedMulTerminalOpening { which, msg } => {
+                write!(f, "malformed multiplicative terminal opening proof for {which}: {msg}")
+            }
+            Self::MulTerminalOpeningMismatch(which) => {
+                write!(f, "multiplicative terminal opening value mismatch for {which}")
+            }
+            Self::MulTerminalOpeningFailed { which, msg } => {
+                write!(f, "multiplicative terminal opening verification failed for {which}: {msg}")
             }
             Self::AadpConstraintUnsatisfied(msg) => {
                 write!(f, "compiled AADP verifier witness does not satisfy constraints: {msg}")
@@ -293,6 +369,277 @@ fn domain_tag_extension(domain: &[u8]) -> SP1ExtensionField {
     bytes_to_extension(&digest)
 }
 
+fn hash_extension_value(h: &mut Sha256, value: &SP1ExtensionField) {
+    for limb in <SP1ExtensionField as AbstractExtensionField<SP1Field>>::as_base_slice(value) {
+        h.update(limb.as_canonical_u32().to_le_bytes());
+    }
+}
+
+fn package_commitment_mix(commitment: &Sp1PackageCommitment) -> SP1ExtensionField {
+    let mut commitment_mix = ext_zero();
+    let mut coord_idx = 0usize;
+    for row in commitment {
+        for coord in row {
+            commitment_mix += commitment_mix_weight(coord_idx) * *coord;
+            coord_idx += 1;
+        }
+    }
+    commitment_mix
+}
+
+fn first_limb_functional_multiplier(weights: [SP1Field; 4]) -> SP1ExtensionField {
+    let w_inv = SP1Field::from_canonical_u32(3)
+        .try_inverse()
+        .expect("SP1 extension binomial constant must be invertible");
+    SP1ExtensionField::from_base_slice(&[
+        weights[0],
+        weights[3] * w_inv,
+        weights[2] * w_inv,
+        weights[1] * w_inv,
+    ])
+}
+
+fn pack_scalar_weights_to_extension_multipliers(weights: &[SP1Field]) -> Vec<SP1ExtensionField> {
+    assert_eq!(
+        weights.len() % ORBWEAVER_RING_COEFFS_PER_EXTENSION_BLOCK,
+        0,
+        "orbweaver packed weights must align to extension blocks"
+    );
+    weights
+        .chunks_exact(ORBWEAVER_RING_COEFFS_PER_EXTENSION_BLOCK)
+        .map(|chunk| {
+            first_limb_functional_multiplier(
+                chunk.try_into().expect("orbweaver extension block has 4 coefficients"),
+            )
+        })
+        .collect()
+}
+
+fn ring_mul_coeff0_weights(multiplier: &KoalaRing64) -> [SP1Field; KOALA_RING64_DIM] {
+    let coeffs = multiplier.coeffs();
+    core::array::from_fn(|idx| {
+        if idx == 0 {
+            coeffs[0]
+        } else {
+            -coeffs[KOALA_RING64_DIM - idx]
+        }
+    })
+}
+
+fn packed_scalar_opening_blocks(proof: &crate::orbweaver_opening::OrbweaverScalarOpeningProof) -> Vec<SP1ExtensionField> {
+    let mut out =
+        Vec::with_capacity(proof.pi0.len() * (KOALA_RING64_DIM / ORBWEAVER_RING_COEFFS_PER_EXTENSION_BLOCK));
+    for ring in &proof.pi0 {
+        out.extend(
+            ring.coeffs()
+                .chunks_exact(ORBWEAVER_RING_COEFFS_PER_EXTENSION_BLOCK)
+                .map(|chunk| SP1ExtensionField::from_base_slice(
+                    chunk.try_into().expect("orbweaver packed proof block has 4 coefficients"),
+                )),
+        );
+    }
+    out
+}
+
+fn orbweaver_proof_commitment_message(
+    proofs: &[crate::orbweaver_opening::OrbweaverScalarOpeningProof; ORBWEAVER_AGGREGATED_SCALAR_OPENINGS],
+) -> Vec<SP1ExtensionField> {
+    let mut out = Vec::new();
+    out.push(domain_tag_extension(b"sp1-germ/orbweaver/proof-commit/v1"));
+    for proof in proofs {
+        out.extend(packed_scalar_opening_blocks(proof));
+    }
+    out
+}
+
+fn compute_orbweaver_proof_commitment(
+    proofs: &[crate::orbweaver_opening::OrbweaverScalarOpeningProof; ORBWEAVER_AGGREGATED_SCALAR_OPENINGS],
+) -> Sp1PackageCommitment {
+    let seed = derive_package_ajtai_seed();
+    let msg = orbweaver_proof_commitment_message(proofs);
+    package_ajtai_commitment(&seed, msg.as_slice())
+}
+
+fn derive_orbweaver_aggregation_coeffs(
+    arming_digest: &[u8; 32],
+    transcript_commitment: &Sp1PackageCommitment,
+    pi_mul_bytes: &[u8],
+) -> [[SP1Field; ORBWEAVER_SCALAR_IMAGE_COUNT]; ORBWEAVER_AGGREGATED_SCALAR_OPENINGS] {
+    let challenge_seed = derive_commitment_bound_seed(arming_digest, transcript_commitment);
+    core::array::from_fn(|agg_idx| {
+        let mut coeffs = core::array::from_fn(|eq_idx| {
+            let mut h = Sha256::new();
+            h.update(b"sp1-germ/orbweaver-aggregation/v1");
+            hash_extension_value(&mut h, &challenge_seed);
+            h.update((agg_idx as u32).to_le_bytes());
+            h.update((eq_idx as u32).to_le_bytes());
+            h.update((pi_mul_bytes.len() as u64).to_le_bytes());
+            h.update(pi_mul_bytes);
+            let digest: [u8; 32] = h.finalize().into();
+            SP1Field::from_wrapped_u32(u32::from_le_bytes([digest[0], digest[1], digest[2], digest[3]]))
+        });
+        if coeffs.iter().all(|coeff| coeff.is_zero()) {
+            coeffs[agg_idx] = SP1Field::one();
+        }
+        coeffs
+    })
+}
+
+fn derive_orbweaver_jl_seed(
+    arming_digest: &[u8; 32],
+    transcript_commitment: &Sp1PackageCommitment,
+    proof_commitment: &Sp1PackageCommitment,
+    srs: &OrbweaverOpeningSrs,
+) -> [u8; 32] {
+    let challenge_seed = derive_commitment_bound_seed(arming_digest, transcript_commitment);
+    let proof_mix = package_commitment_mix(proof_commitment);
+    let jl_seed = derive_seed_from_challenge_seed(
+        b"sp1-germ/orbweaver-jl-seed/v2",
+        challenge_seed,
+        &[bytes_to_extension(&digest_srs(srs)), proof_mix],
+        0,
+    );
+    let mut h = Sha256::new();
+    h.update(b"sp1-germ/orbweaver-jl-seed-bytes/v1");
+    hash_extension_value(&mut h, &jl_seed);
+    h.finalize().into()
+}
+
+fn orbweaver_output_field_multipliers(
+    aggregation_coeffs: &[SP1Field; ORBWEAVER_SCALAR_IMAGE_COUNT],
+) -> [SP1ExtensionField; 4] {
+    core::array::from_fn(|field_idx| {
+        let start = field_idx * 4;
+        first_limb_functional_multiplier(
+            aggregation_coeffs[start..start + 4]
+                .try_into()
+                .expect("orbweaver output multiplier slice has 4 coefficients"),
+        )
+    })
+}
+
+fn orbweaver_c_flat_field_multipliers(
+    srs: &OrbweaverOpeningSrs,
+    mul_terms: usize,
+) -> Result<Vec<[SP1ExtensionField; 4]>, GermError> {
+    let v = scalar_ring_element_to_base_field(&srs.v).map_err(GermError::InvalidOrbweaverSrs)?;
+    let mut cur = v;
+    let mut out = Vec::with_capacity(mul_terms);
+    for _ in 0..mul_terms {
+        let field_weights = core::array::from_fn(|_| {
+            let weights = [cur, cur * v, cur * v * v, cur * v * v * v];
+            cur *= v * v * v * v;
+            first_limb_functional_multiplier(weights)
+        });
+        out.push(field_weights);
+    }
+    Ok(out)
+}
+
+fn orbweaver_lhs_block_multipliers(srs: &OrbweaverOpeningSrs) -> Vec<SP1ExtensionField> {
+    let mut out =
+        Vec::with_capacity(srs.a0.len() * (KOALA_RING64_DIM / ORBWEAVER_RING_COEFFS_PER_EXTENSION_BLOCK));
+    for ring in &srs.a0 {
+        out.extend(pack_scalar_weights_to_extension_multipliers(
+            ring_mul_coeff0_weights(ring).as_slice(),
+        ));
+    }
+    out
+}
+
+fn decode_orbweaver_aggregated_scalar_openings(
+    openings: &Sp1MulTerminalOpeningProofs,
+) -> Result<
+    [crate::orbweaver_opening::OrbweaverScalarOpeningProof; ORBWEAVER_AGGREGATED_SCALAR_OPENINGS],
+    GermError,
+> {
+    Ok([
+        decode_scalar_opening_proof(openings.a.as_slice())
+            .map_err(|msg| GermError::MalformedMulTerminalOpening { which: "agg0", msg })?,
+        decode_scalar_opening_proof(openings.b.as_slice())
+            .map_err(|msg| GermError::MalformedMulTerminalOpening { which: "agg1", msg })?,
+        decode_scalar_opening_proof(openings.c.as_slice())
+            .map_err(|msg| GermError::MalformedMulTerminalOpening { which: "agg2", msg })?,
+        decode_scalar_opening_proof(openings.d.as_slice())
+            .map_err(|msg| GermError::MalformedMulTerminalOpening { which: "agg3", msg })?,
+    ])
+}
+
+fn expected_orbweaver_scalar_image_values(mul_proof: &Sp1MulSumcheckProof) -> [SP1Field; ORBWEAVER_SCALAR_IMAGE_COUNT] {
+    terminal_scalar_image_values(&[
+        mul_proof.opening.a,
+        mul_proof.opening.b,
+        mul_proof.opening.c,
+        mul_proof.opening.d,
+    ])
+}
+
+fn build_orbweaver_transcript_template_data(
+    capsule: &GermArmCapsule,
+    proof_object: &Sp1GermBundle,
+    srs: &OrbweaverOpeningSrs,
+) -> Result<OrbweaverTranscriptTemplateData, GermError> {
+    let mul_proof = decode_mul_sumcheck(&proof_object.pi_mul)?;
+    let arming_digest = capsule.digest();
+    let challenges = derive_challenges_from_capsule(capsule, &proof_object.shared_object_commitment);
+    let sumcheck_seed =
+        derive_mul_sumcheck_seed(&arming_digest, &proof_object.shared_object_commitment, &challenges.r_mul);
+    let opening_weights =
+        eq_table(collect_sumcheck_round_challenges(&sumcheck_seed, &mul_proof)?.as_slice());
+    let aggregation_coeffs = derive_orbweaver_aggregation_coeffs(
+        &arming_digest,
+        &proof_object.shared_object_commitment,
+        proof_object.pi_mul.as_slice(),
+    );
+    let forms = terminal_scalar_image_forms(opening_weights.as_slice());
+    let witness_width = proof_object
+        .mul_terms
+        .len()
+        .checked_mul(ORBWEAVER_SCALAR_IMAGE_COUNT)
+        .ok_or_else(|| {
+            GermError::InvalidOrbweaverSrs("orbweaver witness width overflow".to_string())
+        })?;
+    let v_inv_powers = crate::orbweaver_opening::derive_negative_powers(srs, witness_width)
+        .map_err(GermError::InvalidOrbweaverSrs)?;
+    let aggregated_vk_values = core::array::from_fn(|agg_idx| {
+        let aggregated_form = aggregate_scalar_image_form(&forms, &aggregation_coeffs[agg_idx])
+            .expect("orbweaver aggregated forms must align");
+        let vk =
+            crate::orbweaver_opening::preverify_dense(v_inv_powers.as_slice(), aggregated_form.as_slice())
+                .expect("orbweaver dense preverify should succeed");
+        scalar_ring_element_to_base_field(&vk.value)
+            .expect("orbweaver aggregated verifier key must remain scalar-subring")
+    });
+    let aggregated_output_multipliers =
+        core::array::from_fn(|agg_idx| orbweaver_output_field_multipliers(&aggregation_coeffs[agg_idx]));
+    let proofs = decode_orbweaver_aggregated_scalar_openings(&proof_object.pi_mul_terminal_openings)?;
+    let proof_pi_len = proofs[0].pi0.len();
+    if proofs.iter().any(|proof| proof.pi0.len() != proof_pi_len) {
+        return Err(GermError::TranscriptShapeMismatch {
+            which: "orbweaver aggregated proof length",
+            got: proofs.iter().map(|proof| proof.pi0.len()).max().unwrap_or(0),
+            expected: proof_pi_len,
+        });
+    }
+    let proof_commitment = compute_orbweaver_proof_commitment(&proofs);
+    let jl_seed = derive_orbweaver_jl_seed(
+        &arming_digest,
+        &proof_object.shared_object_commitment,
+        &proof_commitment,
+        srs,
+    );
+    let jl_rows = derive_orbweaver_jl_rows(&jl_seed, proof_pi_len * KOALA_RING64_DIM);
+    Ok(OrbweaverTranscriptTemplateData {
+        aggregated_vk_values,
+        aggregated_output_multipliers,
+        c_flat_field_multipliers: orbweaver_c_flat_field_multipliers(srs, proof_object.mul_terms.len())?,
+        lhs_block_multipliers: orbweaver_lhs_block_multipliers(srs),
+        jl_rows,
+        proof_commitment,
+        proof_pi_len,
+    })
+}
+
 fn linear_descriptor_term_count(descriptor: &LinearResidualDescriptor) -> usize {
     match descriptor {
         LinearResidualDescriptor::PublicValuesPadding { count, .. } => *count,
@@ -300,15 +647,19 @@ fn linear_descriptor_term_count(descriptor: &LinearResidualDescriptor) -> usize 
     }
 }
 
+fn orbweaver_witness_width_from_mul_terms(mul_terms: usize) -> Result<usize, GermError> {
+    mul_terms.checked_mul(ORBWEAVER_SCALAR_IMAGE_COUNT).ok_or_else(|| {
+        GermError::InvalidOrbweaverSrs("orbweaver witness width overflow".to_string())
+    })
+}
+
 fn expected_mul_term_count(plan: &GermResidualPlan) -> Result<usize, GermError> {
-    let target = 1usize
-        .checked_shl(u32::from(plan.sumcheck_rounds))
-        .ok_or_else(|| {
-            GermError::InvalidResidualPlan(format!(
-                "sumcheck_rounds too large for usize shift: {}",
-                plan.sumcheck_rounds
-            ))
-        })?;
+    let target = 1usize.checked_shl(u32::from(plan.sumcheck_rounds)).ok_or_else(|| {
+        GermError::InvalidResidualPlan(format!(
+            "sumcheck_rounds too large for usize shift: {}",
+            plan.sumcheck_rounds
+        ))
+    })?;
     if plan.multiplicative_descriptors.len() > target {
         return Err(GermError::InvalidResidualPlan(format!(
             "descriptor prefix exceeds sumcheck capacity: descriptors={} capacity={target}",
@@ -379,6 +730,7 @@ fn build_commitment_binding_layout(
     let mut degree_bit_slots = BTreeMap::<(String, usize), usize>::new();
     let mut linear_coefficient_indices = Vec::new();
     let mut linear_value_indices = Vec::new();
+    let mut multiplicative_field_exprs = Vec::new();
     let mut column_idx = 0usize;
 
     add_commitment_message_affine_entry(
@@ -429,9 +781,8 @@ fn build_commitment_binding_layout(
             linear_value_indices.push(value_idx);
             match descriptor {
                 _ => {
-                    commitment_slots.push(CommitmentWitnessSlot::LinearValue {
-                        term_idx: linear_term_idx,
-                    });
+                    commitment_slots
+                        .push(CommitmentWitnessSlot::LinearValue { term_idx: linear_term_idx });
                     add_commitment_message_affine_entry(
                         forms.as_mut_slice(),
                         &seed,
@@ -521,12 +872,19 @@ fn build_commitment_binding_layout(
                 );
                 column_idx += 1;
 
+                multiplicative_field_exprs.push([
+                    AffineWitnessExpr::variable(a_idx),
+                    AffineWitnessExpr::variable(b_idx),
+                    AffineWitnessExpr::variable(c_idx),
+                    AffineWitnessExpr::variable(d_idx),
+                ]);
             }
             MultiplicativeResidualDescriptor::DegreeBitBooleanity { .. } => {
                 let (chip_name, bit_number) = match descriptor {
-                    MultiplicativeResidualDescriptor::DegreeBitBooleanity { chip_name, bit_idx } => {
-                        (chip_name.clone(), *bit_idx)
-                    }
+                    MultiplicativeResidualDescriptor::DegreeBitBooleanity {
+                        chip_name,
+                        bit_idx,
+                    } => (chip_name.clone(), *bit_idx),
                     _ => unreachable!(),
                 };
                 let bit_idx = if let Some(existing_idx) =
@@ -579,12 +937,23 @@ fn build_commitment_binding_layout(
                 );
                 column_idx += 1;
 
+                multiplicative_field_exprs.push([
+                    AffineWitnessExpr::variable(bit_idx),
+                    AffineWitnessExpr {
+                        var_idx: Some(bit_idx),
+                        scale: ext_one(),
+                        constant: -ext_one(),
+                    },
+                    AffineWitnessExpr::constant(ext_zero()),
+                    AffineWitnessExpr::constant(ext_one()),
+                ]);
             }
             MultiplicativeResidualDescriptor::DegreeHeightProduct { .. } => {
                 let (chip_name, bit_number) = match descriptor {
-                    MultiplicativeResidualDescriptor::DegreeHeightProduct { chip_name, bit_idx } => {
-                        (chip_name.clone(), *bit_idx)
-                    }
+                    MultiplicativeResidualDescriptor::DegreeHeightProduct {
+                        chip_name,
+                        bit_idx,
+                    } => (chip_name.clone(), *bit_idx),
                     _ => unreachable!(),
                 };
                 let field_a_idx = if let Some(existing_idx) =
@@ -609,18 +978,19 @@ fn build_commitment_binding_layout(
                     ext_zero(),
                 );
                 column_idx += 1;
-                let field_b_idx =
-                    if let Some(existing_idx) = degree_bit_slots.get(&(chip_name.clone(), 0usize)) {
-                        *existing_idx
-                    } else {
-                        let fresh_idx = alloc();
-                        commitment_slots.push(CommitmentWitnessSlot::MultiplicativeField {
-                            term_idx: mul_term_idx,
-                            field: MultiplicativeTermField::B,
-                        });
-                        degree_bit_slots.insert((chip_name, 0usize), fresh_idx);
-                        fresh_idx
-                    };
+                let field_b_idx = if let Some(existing_idx) =
+                    degree_bit_slots.get(&(chip_name.clone(), 0usize))
+                {
+                    *existing_idx
+                } else {
+                    let fresh_idx = alloc();
+                    commitment_slots.push(CommitmentWitnessSlot::MultiplicativeField {
+                        term_idx: mul_term_idx,
+                        field: MultiplicativeTermField::B,
+                    });
+                    degree_bit_slots.insert((chip_name, 0usize), fresh_idx);
+                    fresh_idx
+                };
                 add_commitment_message_affine_entry(
                     forms.as_mut_slice(),
                     &seed,
@@ -649,6 +1019,12 @@ fn build_commitment_binding_layout(
                 );
                 column_idx += 1;
 
+                multiplicative_field_exprs.push([
+                    AffineWitnessExpr::variable(field_a_idx),
+                    AffineWitnessExpr::variable(field_b_idx),
+                    AffineWitnessExpr::constant(ext_zero()),
+                    AffineWitnessExpr::constant(ext_one()),
+                ]);
             }
             MultiplicativeResidualDescriptor::GkrPowWitness
             | MultiplicativeResidualDescriptor::GkrCumulativeSum
@@ -698,6 +1074,12 @@ fn build_commitment_binding_layout(
                 );
                 column_idx += 1;
 
+                multiplicative_field_exprs.push([
+                    AffineWitnessExpr::variable(a_idx),
+                    AffineWitnessExpr::constant(ext_one()),
+                    AffineWitnessExpr::constant(ext_zero()),
+                    AffineWitnessExpr::constant(ext_one()),
+                ]);
             }
             MultiplicativeResidualDescriptor::GkrDenominatorInverse { .. } => {
                 let denominator_idx = alloc();
@@ -748,6 +1130,12 @@ fn build_commitment_binding_layout(
                 );
                 column_idx += 1;
 
+                multiplicative_field_exprs.push([
+                    AffineWitnessExpr::variable(denominator_idx),
+                    AffineWitnessExpr::variable(inverse_idx),
+                    AffineWitnessExpr::constant(ext_one()),
+                    AffineWitnessExpr::constant(ext_one()),
+                ]);
             }
             MultiplicativeResidualDescriptor::GkrRoundFinalEval { .. } => {
                 let eq_eval_idx = alloc();
@@ -804,6 +1192,12 @@ fn build_commitment_binding_layout(
                 );
                 column_idx += 1;
 
+                multiplicative_field_exprs.push([
+                    AffineWitnessExpr::variable(eq_eval_idx),
+                    AffineWitnessExpr::variable(combined_idx),
+                    AffineWitnessExpr::variable(final_eval_idx),
+                    AffineWitnessExpr::constant(ext_one()),
+                ]);
             }
         }
         mul_term_idx += 1;
@@ -847,6 +1241,13 @@ fn build_commitment_binding_layout(
             ext_one(),
         );
         column_idx += 1;
+
+        multiplicative_field_exprs.push([
+            AffineWitnessExpr::constant(ext_zero()),
+            AffineWitnessExpr::constant(ext_one()),
+            AffineWitnessExpr::constant(ext_zero()),
+            AffineWitnessExpr::constant(ext_one()),
+        ]);
     }
 
     Ok(CommitmentBindingLayout {
@@ -856,6 +1257,7 @@ fn build_commitment_binding_layout(
         expected_mul_terms,
         linear_coefficient_indices,
         linear_value_indices,
+        multiplicative_field_exprs,
     })
 }
 
@@ -865,25 +1267,23 @@ fn slot_value_from_proof_object(
 ) -> Result<SP1ExtensionField, GermError> {
     match slot {
         CommitmentWitnessSlot::LinearCoefficient { term_idx } => {
-            proof_object
-                .lin_terms
-                .get(term_idx)
-                .map(|term| term.coefficient)
-                .ok_or(GermError::TranscriptShapeMismatch {
+            proof_object.lin_terms.get(term_idx).map(|term| term.coefficient).ok_or(
+                GermError::TranscriptShapeMismatch {
                     which: "linear commitment slot",
                     got: proof_object.lin_terms.len(),
                     expected: term_idx + 1,
-                })
+                },
+            )
         }
-        CommitmentWitnessSlot::LinearValue { term_idx } => proof_object
-            .lin_terms
-            .get(term_idx)
-            .map(|term| term.value)
-            .ok_or(GermError::TranscriptShapeMismatch {
-                which: "linear commitment slot",
-                got: proof_object.lin_terms.len(),
-                expected: term_idx + 1,
-            }),
+        CommitmentWitnessSlot::LinearValue { term_idx } => {
+            proof_object.lin_terms.get(term_idx).map(|term| term.value).ok_or(
+                GermError::TranscriptShapeMismatch {
+                    which: "linear commitment slot",
+                    got: proof_object.lin_terms.len(),
+                    expected: term_idx + 1,
+                },
+            )
+        }
         CommitmentWitnessSlot::MultiplicativeField { term_idx, field } => proof_object
             .mul_terms
             .get(term_idx)
@@ -933,20 +1333,12 @@ fn derive_commitment_bound_seed(
     arming_digest: &[u8; 32],
     commitment: &Sp1PackageCommitment,
 ) -> SP1ExtensionField {
-    let mut commitment_mix = ext_zero();
-    let mut coord_idx = 0usize;
-    for row in commitment {
-        for coord in row {
-            commitment_mix += commitment_mix_weight(coord_idx) * *coord;
-            coord_idx += 1;
-        }
-    }
     let after_digest = algebraic_absorb(
         bytes_to_extension(b"sp1-germ/challenge-seed/v2"),
         bytes_to_extension(arming_digest),
         1,
     );
-    algebraic_absorb(after_digest, commitment_mix, 2)
+    algebraic_absorb(after_digest, package_commitment_mix(commitment), 2)
 }
 
 fn commitment_mix_weight(coord_idx: usize) -> SP1ExtensionField {
@@ -1015,6 +1407,32 @@ pub fn bind_bundle_to_capsule(
     Ok((commitment_root, challenges))
 }
 
+pub fn bind_bundle_to_capsule_with_orbweaver_terminal_openings(
+    bundle: &mut Sp1GermBundle,
+    capsule: &GermArmCapsule,
+    srs: &OrbweaverOpeningSrs,
+) -> Result<([u8; 32], GermChallenges), GermError> {
+    validate_srs(srs, orbweaver_witness_width_from_mul_terms(bundle.mul_terms.len())?)
+        .map_err(GermError::InvalidOrbweaverSrs)?;
+    let (commitment_root, challenges) = bind_bundle_to_capsule(bundle, capsule)?;
+    bundle.pi_mul_terminal_openings =
+        build_orbweaver_terminal_openings_from_capsule(bundle, capsule, srs)?;
+    let arming_digest = capsule.digest();
+    let mul_check = evaluate_multiplicative_relation_internal(
+        bundle,
+        &arming_digest,
+        &commitment_root,
+        &challenges.r_mul,
+        b"sp1-germ/mul_bind/v1",
+        Some(srs),
+    )?;
+    if !is_zero_ext(&mul_check.folded_residual) {
+        return Err(GermError::NonZeroResidual("mul"));
+    }
+    bundle.mul_binding_tag = mul_check.fingerprint;
+    Ok((commitment_root, challenges))
+}
+
 pub fn bind_bundle(
     bundle: &mut Sp1GermBundle,
     public_values: &GermPublicValues,
@@ -1073,6 +1491,32 @@ pub fn bind_bundle(
     Ok((commitment_root, challenges))
 }
 
+pub fn bind_bundle_with_orbweaver_terminal_openings(
+    bundle: &mut Sp1GermBundle,
+    public_values: &GermPublicValues,
+    srs: &OrbweaverOpeningSrs,
+) -> Result<([u8; 32], GermChallenges), GermError> {
+    validate_srs(srs, orbweaver_witness_width_from_mul_terms(bundle.mul_terms.len())?)
+        .map_err(GermError::InvalidOrbweaverSrs)?;
+    let (commitment_root, challenges) = bind_bundle(bundle, public_values)?;
+    bundle.pi_mul_terminal_openings =
+        build_orbweaver_terminal_openings(bundle, public_values, srs)?;
+    let public_values_digest = public_values.digest();
+    let mul_check = evaluate_multiplicative_relation_internal(
+        bundle,
+        &public_values_digest,
+        &commitment_root,
+        &challenges.r_mul,
+        b"sp1-germ/mul_bind/v1",
+        Some(srs),
+    )?;
+    if !is_zero_ext(&mul_check.folded_residual) {
+        return Err(GermError::NonZeroResidual("mul"));
+    }
+    bundle.mul_binding_tag = mul_check.fingerprint;
+    Ok((commitment_root, challenges))
+}
+
 /// Verify the global linear vanishing check `V_lin(r_lin) = 0`.
 pub fn verify_lin(
     bundle: &Sp1GermBundle,
@@ -1108,12 +1552,13 @@ pub fn verify_mul(
 ) -> Result<GermRelationCheck, GermError> {
     let public_values_digest = public_values.digest();
     let challenges = derive_challenges(public_values, &bundle.shared_object_commitment);
-    let check = evaluate_multiplicative_relation(
+    let check = evaluate_multiplicative_relation_internal(
         bundle,
         &public_values_digest,
         commitment_root,
         &challenges.r_mul,
         b"sp1-germ/mul_bind/v1",
+        None,
     )?;
     if !is_zero_ext(&check.folded_residual) {
         return Err(GermError::NonZeroResidual("mul"));
@@ -1122,6 +1567,108 @@ pub fn verify_mul(
         return Err(GermError::BindingTagMismatch("mul"));
     }
     Ok(check)
+}
+
+pub fn verify_mul_with_orbweaver_terminal_openings(
+    bundle: &Sp1GermBundle,
+    public_values: &GermPublicValues,
+    commitment_root: &[u8; 32],
+    srs: &OrbweaverOpeningSrs,
+) -> Result<GermRelationCheck, GermError> {
+    validate_srs(srs, orbweaver_witness_width_from_mul_terms(bundle.mul_terms.len())?)
+        .map_err(GermError::InvalidOrbweaverSrs)?;
+    let public_values_digest = public_values.digest();
+    let challenges = derive_challenges(public_values, &bundle.shared_object_commitment);
+    let check = evaluate_multiplicative_relation_internal(
+        bundle,
+        &public_values_digest,
+        commitment_root,
+        &challenges.r_mul,
+        b"sp1-germ/mul_bind/v1",
+        Some(srs),
+    )?;
+    if !is_zero_ext(&check.folded_residual) {
+        return Err(GermError::NonZeroResidual("mul"));
+    }
+    if check.fingerprint != bundle.mul_binding_tag {
+        return Err(GermError::BindingTagMismatch("mul"));
+    }
+    Ok(check)
+}
+
+pub fn build_orbweaver_terminal_openings_from_capsule(
+    bundle: &Sp1GermBundle,
+    capsule: &GermArmCapsule,
+    srs: &OrbweaverOpeningSrs,
+) -> Result<crate::bundle::Sp1MulTerminalOpeningProofs, GermError> {
+    validate_srs(srs, orbweaver_witness_width_from_mul_terms(bundle.mul_terms.len())?)
+        .map_err(GermError::InvalidOrbweaverSrs)?;
+    let arming_digest = capsule.digest();
+    let challenges = derive_challenges_from_capsule(capsule, &bundle.shared_object_commitment);
+    build_orbweaver_terminal_openings_internal(bundle, &arming_digest, &challenges.r_mul, srs)
+}
+
+pub fn build_orbweaver_terminal_openings(
+    bundle: &Sp1GermBundle,
+    public_values: &GermPublicValues,
+    srs: &OrbweaverOpeningSrs,
+) -> Result<crate::bundle::Sp1MulTerminalOpeningProofs, GermError> {
+    validate_srs(srs, orbweaver_witness_width_from_mul_terms(bundle.mul_terms.len())?)
+        .map_err(GermError::InvalidOrbweaverSrs)?;
+    let public_values_digest = public_values.digest();
+    let challenges = derive_challenges(public_values, &bundle.shared_object_commitment);
+    build_orbweaver_terminal_openings_internal(
+        bundle,
+        &public_values_digest,
+        &challenges.r_mul,
+        srs,
+    )
+}
+
+pub fn verify_orbweaver_terminal_openings_from_capsule(
+    bundle: &Sp1GermBundle,
+    capsule: &GermArmCapsule,
+    srs: &OrbweaverOpeningSrs,
+) -> Result<(), GermError> {
+    validate_srs(srs, orbweaver_witness_width_from_mul_terms(bundle.mul_terms.len())?)
+        .map_err(GermError::InvalidOrbweaverSrs)?;
+    let arming_digest = capsule.digest();
+    let commitment_root = compute_commitment_root(&bundle.shared_object_commitment);
+    let challenges = derive_challenges_from_capsule(capsule, &bundle.shared_object_commitment);
+    let _ = evaluate_multiplicative_relation(
+        bundle,
+        &arming_digest,
+        &commitment_root,
+        &challenges.r_mul,
+        b"sp1-germ/mul_bind/v1",
+    )?;
+
+    let mul_proof = decode_mul_sumcheck(&bundle.pi_mul)?;
+    let round_challenges = collect_sumcheck_round_challenges(
+        &derive_mul_sumcheck_seed(
+            &arming_digest,
+            &bundle.shared_object_commitment,
+            &challenges.r_mul,
+        ),
+        &mul_proof,
+    )?;
+    let weights = eq_table(round_challenges.as_slice());
+    let aggregation_coeffs = derive_orbweaver_aggregation_coeffs(
+        &arming_digest,
+        &bundle.shared_object_commitment,
+        bundle.pi_mul.as_slice(),
+    );
+    let expected_scalar_values = expected_orbweaver_scalar_image_values(&mul_proof);
+    verify_aggregated_scalar_image_openings_from_mul_terms(
+        srs,
+        bundle.mul_terms.as_slice(),
+        weights.as_slice(),
+        &aggregation_coeffs,
+        &expected_scalar_values,
+        &bundle.pi_mul_terminal_openings,
+    )
+    .map_err(|msg| GermError::MulTerminalOpeningFailed { which: "terminal", msg })?;
+    Ok(())
 }
 
 pub fn verify_transcript_bound_sp1_germ_proof_object(
@@ -1167,9 +1714,184 @@ pub fn verify_transcript_bound_sp1_germ_proof_object(
     Ok(())
 }
 
+pub fn verify_transcript_bound_sp1_germ_proof_object_with_orbweaver_terminal_openings(
+    transcript_bound: &TranscriptBoundSp1GermProofObject,
+    capsule: &GermArmCapsule,
+    srs: &OrbweaverOpeningSrs,
+) -> Result<(), GermError> {
+    validate_srs(
+        srs,
+        orbweaver_witness_width_from_mul_terms(transcript_bound.proof_object.mul_terms.len())?,
+    )
+        .map_err(GermError::InvalidOrbweaverSrs)?;
+    let arming_digest = capsule.digest();
+    let computed_root =
+        compute_commitment_root(&transcript_bound.proof_object.shared_object_commitment);
+    if computed_root != transcript_bound.commitment_root {
+        return Err(GermError::CommitmentRootMismatch);
+    }
+    let challenges = derive_challenges_from_capsule(
+        capsule,
+        &transcript_bound.proof_object.shared_object_commitment,
+    );
+    let lin_check = evaluate_linear_relation(
+        &transcript_bound.proof_object,
+        &arming_digest,
+        &transcript_bound.commitment_root,
+        &challenges.r_lin,
+        b"sp1-germ/lin_bind/v1",
+    )?;
+    if !is_zero_ext(&lin_check.folded_residual) {
+        return Err(GermError::NonZeroResidual("lin"));
+    }
+    if lin_check.fingerprint != transcript_bound.proof_object.lin_binding_tag {
+        return Err(GermError::BindingTagMismatch("lin"));
+    }
+    let mul_check = evaluate_multiplicative_relation_internal(
+        &transcript_bound.proof_object,
+        &arming_digest,
+        &transcript_bound.commitment_root,
+        &challenges.r_mul,
+        b"sp1-germ/mul_bind/v1",
+        Some(srs),
+    )?;
+    if !is_zero_ext(&mul_check.folded_residual) {
+        return Err(GermError::NonZeroResidual("mul"));
+    }
+    if mul_check.fingerprint != transcript_bound.proof_object.mul_binding_tag {
+        return Err(GermError::BindingTagMismatch("mul"));
+    }
+    Ok(())
+}
+
 pub fn compile_germ_aadp_template(
     capsule: &GermArmCapsule,
     residual_plan: &GermResidualPlan,
+) -> Result<GermAadpVerifierTemplate, GermError> {
+    compile_germ_aadp_template_internal(capsule, residual_plan, None, None)
+}
+
+pub fn compile_transcript_bound_germ_aadp_template_with_orbweaver_terminal_openings(
+    capsule: &GermArmCapsule,
+    residual_plan: &GermResidualPlan,
+    transcript_bound: &TranscriptBoundSp1GermProofObject,
+    srs: &OrbweaverOpeningSrs,
+) -> Result<GermAadpVerifierTemplate, GermError> {
+    validate_residual_plan_for_template(capsule, residual_plan)?;
+    validate_srs(
+        srs,
+        orbweaver_witness_width_from_mul_terms(transcript_bound.proof_object.mul_terms.len())?,
+    )
+        .map_err(GermError::InvalidOrbweaverSrs)?;
+    verify_transcript_bound_sp1_germ_proof_object_with_orbweaver_terminal_openings(
+        transcript_bound,
+        capsule,
+        srs,
+    )?;
+    let expected_linear_terms =
+        residual_plan.linear_descriptors.iter().map(linear_descriptor_term_count).sum::<usize>();
+    if transcript_bound.proof_object.lin_terms.len() != expected_linear_terms {
+        return Err(GermError::TranscriptShapeMismatch {
+            which: "linear terms",
+            got: transcript_bound.proof_object.lin_terms.len(),
+            expected: expected_linear_terms,
+        });
+    }
+    let expected_mul_terms = expected_mul_term_count(residual_plan)?;
+    if transcript_bound.proof_object.mul_terms.len() != expected_mul_terms {
+        return Err(GermError::TranscriptShapeMismatch {
+            which: "multiplicative terms",
+            got: transcript_bound.proof_object.mul_terms.len(),
+            expected: expected_mul_terms,
+        });
+    }
+    let orbweaver_data =
+        build_orbweaver_transcript_template_data(capsule, &transcript_bound.proof_object, srs)?;
+    compile_germ_aadp_template_internal(
+        capsule,
+        residual_plan,
+        None,
+        Some(&orbweaver_data),
+    )
+}
+
+pub fn arm_transcript_bound_germ_aadp_template_with_orbweaver_terminal_openings<R: RngCore>(
+    capsule: &GermArmCapsule,
+    residual_plan: &GermResidualPlan,
+    transcript_bound: &TranscriptBoundSp1GermProofObject,
+    srs: &OrbweaverOpeningSrs,
+    message: SP1ExtensionField,
+    rng: &mut R,
+) -> Result<ArmedGermAadpCiphertext, GermError> {
+    let template = compile_transcript_bound_germ_aadp_template_with_orbweaver_terminal_openings(
+        capsule,
+        residual_plan,
+        transcript_bound,
+        srs,
+    )?;
+    let ciphertext =
+        aadp_encrypt_scalar(&template.cs, message, rng).map_err(GermError::AadpEncryptFailed)?;
+    Ok(ArmedGermAadpCiphertext { template, ciphertext, capsule_digest: capsule.digest() })
+}
+
+pub fn compile_transcript_bound_germ_aadp_template(
+    capsule: &GermArmCapsule,
+    residual_plan: &GermResidualPlan,
+    transcript_bound: &TranscriptBoundSp1GermProofObject,
+) -> Result<GermAadpVerifierTemplate, GermError> {
+    validate_residual_plan_for_template(capsule, residual_plan)?;
+    verify_transcript_bound_sp1_germ_proof_object(transcript_bound, capsule)?;
+
+    let expected_linear_terms =
+        residual_plan.linear_descriptors.iter().map(linear_descriptor_term_count).sum::<usize>();
+    if transcript_bound.proof_object.lin_terms.len() != expected_linear_terms {
+        return Err(GermError::TranscriptShapeMismatch {
+            which: "linear terms",
+            got: transcript_bound.proof_object.lin_terms.len(),
+            expected: expected_linear_terms,
+        });
+    }
+    let expected_mul_terms = expected_mul_term_count(residual_plan)?;
+    if transcript_bound.proof_object.mul_terms.len() != expected_mul_terms {
+        return Err(GermError::TranscriptShapeMismatch {
+            which: "multiplicative terms",
+            got: transcript_bound.proof_object.mul_terms.len(),
+            expected: expected_mul_terms,
+        });
+    }
+
+    let proof_object = &transcript_bound.proof_object;
+    let mul_proof = decode_mul_sumcheck(&proof_object.pi_mul)?;
+    if usize::from(capsule.sumcheck_rounds) != mul_proof.rounds.len() {
+        return Err(GermError::SumcheckRoundsMismatch {
+            got: mul_proof.rounds.len(),
+            expected: usize::from(capsule.sumcheck_rounds),
+        });
+    }
+    let arming_digest = capsule.digest();
+    let challenges =
+        derive_challenges_from_capsule(capsule, &proof_object.shared_object_commitment);
+    let sumcheck_seed = derive_mul_sumcheck_seed(
+        &arming_digest,
+        &proof_object.shared_object_commitment,
+        &challenges.r_mul,
+    );
+    let opening_weights =
+        eq_table(collect_sumcheck_round_challenges(&sumcheck_seed, &mul_proof)?.as_slice());
+
+    compile_germ_aadp_template_internal(
+        capsule,
+        residual_plan,
+        Some(opening_weights.as_slice()),
+        None,
+    )
+}
+
+fn compile_germ_aadp_template_internal(
+    capsule: &GermArmCapsule,
+    residual_plan: &GermResidualPlan,
+    terminal_opening_weights: Option<&[SP1ExtensionField]>,
+    orbweaver_template_data: Option<&OrbweaverTranscriptTemplateData>,
 ) -> Result<GermAadpVerifierTemplate, GermError> {
     validate_residual_plan_for_template(capsule, residual_plan)?;
 
@@ -1349,10 +2071,7 @@ pub fn compile_germ_aadp_template(
     let binding_layout =
         build_commitment_binding_layout(&mut alloc, &commitment_coord_indices, residual_plan)?;
     for form in binding_layout.commitment_forms.iter().cloned() {
-        add_linear_zero_constraint(
-            &mut constraints,
-            form,
-        );
+        add_linear_zero_constraint(&mut constraints, form);
         opening_checks += 1;
     }
 
@@ -1455,8 +2174,9 @@ pub fn compile_germ_aadp_template(
             lin_point_indices.push(lin_point_idx);
         }
 
-        let mut lin_table_forms =
-            Vec::<AadpLinearForm<SP1ExtensionField>>::with_capacity(binding_layout.expected_linear_terms.max(1).next_power_of_two());
+        let mut lin_table_forms = Vec::<AadpLinearForm<SP1ExtensionField>>::with_capacity(
+            binding_layout.expected_linear_terms.max(1).next_power_of_two(),
+        );
         for term_idx in 0..binding_layout.expected_linear_terms {
             let value_idx = binding_layout.linear_value_indices[term_idx];
             if let Some(coeff_idx) = binding_layout.linear_coefficient_indices[term_idx] {
@@ -1489,7 +2209,8 @@ pub fn compile_germ_aadp_template(
                     delta_idx,
                 );
                 multiplication_gates += 1;
-                next_forms.push(linear_form_add_forms(&pair[0], &linear_form_single_var(delta_idx)));
+                next_forms
+                    .push(linear_form_add_forms(&pair[0], &linear_form_single_var(delta_idx)));
             }
             lin_table_forms = next_forms;
         }
@@ -1499,10 +2220,7 @@ pub fn compile_germ_aadp_template(
             linear_form_sub_forms(&linear_form_single_var(lin_claim_idx), &lin_table_forms[0]),
         );
         linear_round_checks += 1;
-        add_linear_zero_constraint(
-            &mut constraints,
-            linear_form_single_var(lin_claim_idx),
-        );
+        add_linear_zero_constraint(&mut constraints, linear_form_single_var(lin_claim_idx));
         linear_round_checks += 1;
     }
 
@@ -1629,6 +2347,260 @@ pub fn compile_germ_aadp_template(
         d: linear_form_single_var(opening_rhs_product_idx),
     });
     multiplication_gates += 2;
+
+    let orbweaver_terminal_pi_len = if let Some(orbweaver_data) = orbweaver_template_data {
+        let seed = derive_package_ajtai_seed();
+        let mut proof_commitment_forms = (0..PACKAGE_AJTAI_ROWS)
+            .flat_map(|row| {
+                (0..PACKAGE_AJTAI_RING_DIM).map(move |coeff_idx| AadpLinearForm {
+                    constant: orbweaver_data.proof_commitment[row][coeff_idx],
+                    terms: Vec::new(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut column_idx = 0usize;
+        add_commitment_message_affine_entry(
+            proof_commitment_forms.as_mut_slice(),
+            &seed,
+            column_idx,
+            None,
+            ext_zero(),
+            domain_tag_extension(b"sp1-germ/orbweaver/proof-commit/v1"),
+        );
+        column_idx += 1;
+        let proof_block_len = orbweaver_data.lhs_block_multipliers.len();
+        let mut proof_block_indices =
+            vec![Vec::<usize>::with_capacity(proof_block_len); ORBWEAVER_AGGREGATED_SCALAR_OPENINGS];
+        for proof_idx in 0..ORBWEAVER_AGGREGATED_SCALAR_OPENINGS {
+            for _ in 0..proof_block_len {
+                let block_idx = alloc();
+                proof_block_indices[proof_idx].push(block_idx);
+                add_commitment_message_affine_entry(
+                    proof_commitment_forms.as_mut_slice(),
+                    &seed,
+                    column_idx,
+                    Some(block_idx),
+                    ext_one(),
+                    ext_zero(),
+                );
+                column_idx += 1;
+            }
+        }
+        for form in proof_commitment_forms {
+            add_linear_zero_constraint(&mut constraints, form);
+            opening_checks += 1;
+        }
+
+        let c_flat_ext_idx = alloc();
+        let c_flat_limb_indices = [alloc(), alloc(), alloc(), alloc()];
+        let mut c_flat_form =
+            AadpLinearForm { constant: ext_zero(), terms: vec![(c_flat_ext_idx, ext_one())] };
+        for (field_multipliers, exprs) in orbweaver_data
+            .c_flat_field_multipliers
+            .iter()
+            .zip(binding_layout.multiplicative_field_exprs.iter())
+        {
+            for field_idx in 0..4 {
+                add_scaled_affine_expr(&mut c_flat_form, exprs[field_idx], -field_multipliers[field_idx]);
+            }
+        }
+        add_linear_zero_constraint(&mut constraints, c_flat_form);
+        opening_checks += 1;
+        add_linear_zero_constraint(
+            &mut constraints,
+            AadpLinearForm {
+                constant: ext_zero(),
+                terms: vec![
+                    (c_flat_ext_idx, ext_one()),
+                    (c_flat_limb_indices[0], -ext_one()),
+                    (c_flat_limb_indices[1], -ext_basis_u()),
+                    (c_flat_limb_indices[2], -ext_basis_u_squared()),
+                    (c_flat_limb_indices[3], -ext_basis_u_cubed()),
+                ],
+            },
+        );
+        opening_checks += 1;
+
+        let opening_indices = [opening_a_idx, opening_b_idx, opening_c_idx, opening_d_idx];
+        for proof_idx in 0..ORBWEAVER_AGGREGATED_SCALAR_OPENINGS {
+            let lhs_ext_idx = alloc();
+            let lhs_limb_indices = [alloc(), alloc(), alloc(), alloc()];
+            let mut lhs_form =
+                AadpLinearForm { constant: ext_zero(), terms: vec![(lhs_ext_idx, ext_one())] };
+            for (block_idx, coeff) in proof_block_indices[proof_idx]
+                .iter()
+                .zip(orbweaver_data.lhs_block_multipliers.iter())
+            {
+                lhs_form.terms.push((*block_idx, -*coeff));
+            }
+            add_linear_zero_constraint(&mut constraints, lhs_form);
+            opening_checks += 1;
+            add_linear_zero_constraint(
+                &mut constraints,
+                AadpLinearForm {
+                    constant: ext_zero(),
+                    terms: vec![
+                        (lhs_ext_idx, ext_one()),
+                        (lhs_limb_indices[0], -ext_one()),
+                        (lhs_limb_indices[1], -ext_basis_u()),
+                        (lhs_limb_indices[2], -ext_basis_u_squared()),
+                        (lhs_limb_indices[3], -ext_basis_u_cubed()),
+                    ],
+                },
+            );
+            opening_checks += 1;
+
+            let output_ext_idx = alloc();
+            let output_limb_indices = [alloc(), alloc(), alloc(), alloc()];
+            let mut output_form =
+                AadpLinearForm { constant: ext_zero(), terms: vec![(output_ext_idx, ext_one())] };
+            for field_idx in 0..4 {
+                output_form
+                    .terms
+                    .push((opening_indices[field_idx], -orbweaver_data.aggregated_output_multipliers[proof_idx][field_idx]));
+            }
+            add_linear_zero_constraint(&mut constraints, output_form);
+            opening_checks += 1;
+            add_linear_zero_constraint(
+                &mut constraints,
+                AadpLinearForm {
+                    constant: ext_zero(),
+                    terms: vec![
+                        (output_ext_idx, ext_one()),
+                        (output_limb_indices[0], -ext_one()),
+                        (output_limb_indices[1], -ext_basis_u()),
+                        (output_limb_indices[2], -ext_basis_u_squared()),
+                        (output_limb_indices[3], -ext_basis_u_cubed()),
+                    ],
+                },
+            );
+            opening_checks += 1;
+
+            add_linear_zero_constraint(
+                &mut constraints,
+                AadpLinearForm {
+                    constant: ext_zero(),
+                    terms: vec![
+                        (lhs_limb_indices[0], ext_one()),
+                        (c_flat_limb_indices[0], -ext_from_base_field(orbweaver_data.aggregated_vk_values[proof_idx])),
+                        (output_limb_indices[0], ext_one()),
+                    ],
+                },
+            );
+            opening_checks += 1;
+
+            for row in &orbweaver_data.jl_rows[proof_idx] {
+                let row_weights = row
+                    .iter()
+                    .map(|coeff| match *coeff {
+                        1 => SP1Field::one(),
+                        -1 => -SP1Field::one(),
+                        _ => SP1Field::zero(),
+                    })
+                    .collect::<Vec<_>>();
+                let row_multipliers =
+                    pack_scalar_weights_to_extension_multipliers(row_weights.as_slice());
+                let projection_ext_idx = alloc();
+                let projection_limb_indices = [alloc(), alloc(), alloc(), alloc()];
+                let mut projection_form = AadpLinearForm {
+                    constant: ext_zero(),
+                    terms: vec![(projection_ext_idx, ext_one())],
+                };
+                for (block_idx, coeff) in
+                    proof_block_indices[proof_idx].iter().zip(row_multipliers.iter())
+                {
+                    projection_form.terms.push((*block_idx, -*coeff));
+                }
+                add_linear_zero_constraint(&mut constraints, projection_form);
+                opening_checks += 1;
+                add_linear_zero_constraint(
+                    &mut constraints,
+                    AadpLinearForm {
+                        constant: ext_zero(),
+                        terms: vec![
+                            (projection_ext_idx, ext_one()),
+                            (projection_limb_indices[0], -ext_one()),
+                            (projection_limb_indices[1], -ext_basis_u()),
+                            (projection_limb_indices[2], -ext_basis_u_squared()),
+                            (projection_limb_indices[3], -ext_basis_u_cubed()),
+                        ],
+                    },
+                );
+                opening_checks += 1;
+
+                let mut signed_terms = vec![(projection_limb_indices[0], ext_one())];
+                for bit in 0..ORBWEAVER_JL_SIGNED_BITS {
+                    let bit_idx = alloc();
+                    add_bit_constraint(&mut constraints, bit_idx);
+                    multiplication_gates += 1;
+                    let bit_weight = if bit + 1 == ORBWEAVER_JL_SIGNED_BITS {
+                        -(1i64 << (ORBWEAVER_JL_SIGNED_BITS - 1))
+                    } else {
+                        1i64 << bit
+                    };
+                    signed_terms.push((bit_idx, -ext_from_i64(bit_weight)));
+                }
+                add_linear_zero_constraint(
+                    &mut constraints,
+                    AadpLinearForm { constant: ext_zero(), terms: signed_terms },
+                );
+                opening_checks += 1;
+            }
+        }
+        orbweaver_data.proof_pi_len
+    } else if let Some(weights) = terminal_opening_weights {
+        if weights.len() != binding_layout.multiplicative_field_exprs.len() {
+            return Err(GermError::TranscriptShapeMismatch {
+                which: "terminal opening weights",
+                got: weights.len(),
+                expected: binding_layout.multiplicative_field_exprs.len(),
+            });
+        }
+        let opening_bindings = [
+            (
+                opening_a_idx,
+                build_weighted_mul_opening_form(
+                    weights,
+                    binding_layout.multiplicative_field_exprs.as_slice(),
+                    MultiplicativeTermField::A,
+                ),
+            ),
+            (
+                opening_b_idx,
+                build_weighted_mul_opening_form(
+                    weights,
+                    binding_layout.multiplicative_field_exprs.as_slice(),
+                    MultiplicativeTermField::B,
+                ),
+            ),
+            (
+                opening_c_idx,
+                build_weighted_mul_opening_form(
+                    weights,
+                    binding_layout.multiplicative_field_exprs.as_slice(),
+                    MultiplicativeTermField::C,
+                ),
+            ),
+            (
+                opening_d_idx,
+                build_weighted_mul_opening_form(
+                    weights,
+                    binding_layout.multiplicative_field_exprs.as_slice(),
+                    MultiplicativeTermField::D,
+                ),
+            ),
+        ];
+        for (opening_idx, opening_form) in opening_bindings {
+            add_linear_zero_constraint(
+                &mut constraints,
+                linear_form_sub_forms(&linear_form_single_var(opening_idx), &opening_form),
+            );
+            opening_checks += 1;
+        }
+        0
+    } else {
+        0
+    };
 
     if capsule.sumcheck_rounds == 0 {
         add_linear_zero_constraint(
@@ -1762,6 +2734,12 @@ pub fn compile_germ_aadp_template(
                 .iter()
                 .map(|idx| idx.is_some())
                 .collect(),
+            orbweaver_terminal_pi_len,
+            orbweaver_aggregated_proof_count: if orbweaver_template_data.is_some() {
+                ORBWEAVER_AGGREGATED_SCALAR_OPENINGS
+            } else {
+                0
+            },
         },
         stats: GermAadpConstraintStats {
             linear_round_checks,
@@ -1794,10 +2772,46 @@ pub fn materialize_transcript_bound_germ_aadp_witness(
     capsule: &GermArmCapsule,
     transcript_bound: &TranscriptBoundSp1GermProofObject,
 ) -> Result<GermAadpWitness, GermError> {
+    materialize_transcript_bound_germ_aadp_witness_internal(
+        template,
+        capsule,
+        transcript_bound,
+        None,
+    )
+}
+
+pub fn materialize_transcript_bound_germ_aadp_witness_with_orbweaver_terminal_openings(
+    template: &GermAadpVerifierTemplate,
+    capsule: &GermArmCapsule,
+    transcript_bound: &TranscriptBoundSp1GermProofObject,
+    srs: &OrbweaverOpeningSrs,
+) -> Result<GermAadpWitness, GermError> {
+    materialize_transcript_bound_germ_aadp_witness_internal(
+        template,
+        capsule,
+        transcript_bound,
+        Some(srs),
+    )
+}
+
+fn materialize_transcript_bound_germ_aadp_witness_internal(
+    template: &GermAadpVerifierTemplate,
+    capsule: &GermArmCapsule,
+    transcript_bound: &TranscriptBoundSp1GermProofObject,
+    orbweaver_srs: Option<&OrbweaverOpeningSrs>,
+) -> Result<GermAadpWitness, GermError> {
     if template.capsule_digest != capsule.digest() {
         return Err(GermError::TemplateCapsuleMismatch);
     }
-    verify_transcript_bound_sp1_germ_proof_object(transcript_bound, capsule)?;
+    if let Some(srs) = orbweaver_srs {
+        verify_transcript_bound_sp1_germ_proof_object_with_orbweaver_terminal_openings(
+            transcript_bound,
+            capsule,
+            srs,
+        )?;
+    } else {
+        verify_transcript_bound_sp1_germ_proof_object(transcript_bound, capsule)?;
+    }
 
     let proof_object = &transcript_bound.proof_object;
     let lin_proof = decode_lin_proof(&proof_object.pi_lin)?;
@@ -1956,7 +2970,8 @@ pub fn materialize_transcript_bound_germ_aadp_witness(
         let lin_right_seed_state = lin_right_seed_absorb_sq * (lin_right_seed_absorb + ext_one());
         push(&mut witness, lin_right_seed_absorb_sq);
         push(&mut witness, lin_right_seed_state);
-        let lin_right_idx_absorb = lin_right_seed_state + ext_from_u32(3) + absorb_round_constant(16);
+        let lin_right_idx_absorb =
+            lin_right_seed_state + ext_from_u32(3) + absorb_round_constant(16);
         let lin_right_idx_absorb_sq = lin_right_idx_absorb * lin_right_idx_absorb;
         let lin_right_idx_state = lin_right_idx_absorb_sq * (lin_right_idx_absorb + ext_one());
         push(&mut witness, lin_right_idx_absorb_sq);
@@ -1977,7 +2992,8 @@ pub fn materialize_transcript_bound_germ_aadp_witness(
                 + lin_point_seed
                 + absorb_round_constant((var_idx as u32).wrapping_add(11));
             let lin_point_seed_absorb_sq = lin_point_seed_absorb * lin_point_seed_absorb;
-            let lin_point_seed_state = lin_point_seed_absorb_sq * (lin_point_seed_absorb + ext_one());
+            let lin_point_seed_state =
+                lin_point_seed_absorb_sq * (lin_point_seed_absorb + ext_one());
             push(&mut witness, lin_point_seed_absorb_sq);
             push(&mut witness, lin_point_seed_state);
             let lin_point_idx_absorb = lin_point_seed_state
@@ -1990,7 +3006,8 @@ pub fn materialize_transcript_bound_germ_aadp_witness(
             lin_point.push(lin_point_i);
         }
 
-        let mut lin_table = Vec::with_capacity(template.layout.expected_linear_terms.max(1).next_power_of_two());
+        let mut lin_table =
+            Vec::with_capacity(template.layout.expected_linear_terms.max(1).next_power_of_two());
         for term_idx in 0..template.layout.expected_linear_terms {
             let term = proof_object.lin_terms[term_idx];
             let product = term.coefficient * term.value;
@@ -2026,8 +3043,12 @@ pub fn materialize_transcript_bound_germ_aadp_witness(
             push(&mut witness, eval);
         }
 
-        let r_sc =
-            materialize_challenge_from_seed_trace(&mut witness, MUL_SUMCHECK_ROUND_CHALLENGE_DOMAIN, round_state, 0);
+        let r_sc = materialize_challenge_from_seed_trace(
+            &mut witness,
+            MUL_SUMCHECK_ROUND_CHALLENGE_DOMAIN,
+            round_state,
+            0,
+        );
 
         sampled.push(r_sc);
 
@@ -2044,7 +3065,8 @@ pub fn materialize_transcript_bound_germ_aadp_witness(
 
         let claimed_next = e[0] + m_c;
         push(&mut witness, claimed_next);
-        round_state = materialize_sumcheck_round_state_trace(&mut witness, round_state, &e, claimed_next);
+        round_state =
+            materialize_sumcheck_round_state_trace(&mut witness, round_state, &e, claimed_next);
     }
 
     push(&mut witness, mul_proof.opening.a);
@@ -2056,6 +3078,108 @@ pub fn materialize_transcript_bound_germ_aadp_witness(
     let opening_rhs_product = mul_proof.opening.c * mul_proof.opening.d;
     push(&mut witness, opening_lhs_product);
     push(&mut witness, opening_rhs_product);
+    if template.layout.orbweaver_terminal_pi_len > 0 {
+        let srs = orbweaver_srs.ok_or_else(|| {
+            GermError::InvalidOrbweaverSrs("orbweaver template requires SRS".to_string())
+        })?;
+        let orbweaver_data = build_orbweaver_transcript_template_data(capsule, proof_object, srs)?;
+        if template.layout.orbweaver_terminal_pi_len != orbweaver_data.proof_pi_len
+            || template.layout.orbweaver_aggregated_proof_count
+                != ORBWEAVER_AGGREGATED_SCALAR_OPENINGS
+        {
+            return Err(GermError::TranscriptShapeMismatch {
+                which: "orbweaver aggregated proof shape",
+                got: orbweaver_data.proof_pi_len,
+                expected: template.layout.orbweaver_terminal_pi_len,
+            });
+        }
+        let proofs = decode_orbweaver_aggregated_scalar_openings(&proof_object.pi_mul_terminal_openings)?;
+        for proof in &proofs {
+            for packed in packed_scalar_opening_blocks(proof) {
+                push(&mut witness, packed);
+            }
+        }
+
+        let mut c_flat_ext = ext_zero();
+        for (term, field_multipliers) in proof_object
+            .mul_terms
+            .iter()
+            .zip(orbweaver_data.c_flat_field_multipliers.iter())
+        {
+            c_flat_ext += field_multipliers[0] * term.a;
+            c_flat_ext += field_multipliers[1] * term.b;
+            c_flat_ext += field_multipliers[2] * term.c;
+            c_flat_ext += field_multipliers[3] * term.d;
+        }
+        push(&mut witness, c_flat_ext);
+        for limb in <SP1ExtensionField as AbstractExtensionField<SP1Field>>::as_base_slice(&c_flat_ext) {
+            push(&mut witness, ext_from_base_field(*limb));
+        }
+
+        let opening_values = [
+            mul_proof.opening.a,
+            mul_proof.opening.b,
+            mul_proof.opening.c,
+            mul_proof.opening.d,
+        ];
+        for (proof_idx, proof) in proofs.iter().enumerate() {
+            let proof_blocks = packed_scalar_opening_blocks(proof);
+            let mut lhs_ext = ext_zero();
+            for (packed, coeff) in proof_blocks.iter().zip(orbweaver_data.lhs_block_multipliers.iter()) {
+                lhs_ext += *coeff * *packed;
+            }
+            push(&mut witness, lhs_ext);
+            for limb in
+                <SP1ExtensionField as AbstractExtensionField<SP1Field>>::as_base_slice(&lhs_ext)
+            {
+                push(&mut witness, ext_from_base_field(*limb));
+            }
+
+            let mut output_ext = ext_zero();
+            for field_idx in 0..4 {
+                output_ext +=
+                    orbweaver_data.aggregated_output_multipliers[proof_idx][field_idx]
+                        * opening_values[field_idx];
+            }
+            push(&mut witness, output_ext);
+            for limb in
+                <SP1ExtensionField as AbstractExtensionField<SP1Field>>::as_base_slice(&output_ext)
+            {
+                push(&mut witness, ext_from_base_field(*limb));
+            }
+
+            for row in &orbweaver_data.jl_rows[proof_idx] {
+                let row_weights = row
+                    .iter()
+                    .map(|coeff| match *coeff {
+                        1 => SP1Field::one(),
+                        -1 => -SP1Field::one(),
+                        _ => SP1Field::zero(),
+                    })
+                    .collect::<Vec<_>>();
+                let row_multipliers =
+                    pack_scalar_weights_to_extension_multipliers(row_weights.as_slice());
+                let mut projection_ext = ext_zero();
+                for (packed, coeff) in proof_blocks.iter().zip(row_multipliers.iter()) {
+                    projection_ext += *coeff * *packed;
+                }
+                push(&mut witness, projection_ext);
+                let projection_limbs =
+                    <SP1ExtensionField as AbstractExtensionField<SP1Field>>::as_base_slice(
+                        &projection_ext,
+                    );
+                for limb in projection_limbs {
+                    push(&mut witness, ext_from_base_field(*limb));
+                }
+                let signed_projection = centered_sp1_i64(projection_limbs[0]);
+                let bits = decompose_signed_bits(signed_projection, ORBWEAVER_JL_SIGNED_BITS)
+                    .map_err(GermError::AadpConstraintUnsatisfied)?;
+                for bit in bits {
+                    push(&mut witness, ext_from_u32(bit as u32));
+                }
+            }
+        }
+    }
     let delta = opening_lhs_product - opening_rhs_product;
     if capsule.sumcheck_rounds > 0 {
         for var_idx in 0..usize::from(capsule.sumcheck_rounds) {
@@ -2161,6 +3285,24 @@ fn evaluate_multiplicative_relation(
     r_mul: &SP1ExtensionField,
     domain: &[u8],
 ) -> Result<GermRelationCheck, GermError> {
+    evaluate_multiplicative_relation_internal(
+        bundle,
+        public_values_digest,
+        commitment_root,
+        r_mul,
+        domain,
+        None,
+    )
+}
+
+fn evaluate_multiplicative_relation_internal(
+    bundle: &Sp1GermBundle,
+    public_values_digest: &[u8; 32],
+    commitment_root: &[u8; 32],
+    r_mul: &SP1ExtensionField,
+    domain: &[u8],
+    orbweaver_srs: Option<&OrbweaverOpeningSrs>,
+) -> Result<GermRelationCheck, GermError> {
     if bundle.pi_mul.is_empty() {
         return Err(GermError::EmptyProof("mul"));
     }
@@ -2187,6 +3329,32 @@ fn evaluate_multiplicative_relation(
     }
     verify_mul_sumcheck(&sumcheck_seed, &parsed_sumcheck)?;
     let relation_digest = digest_multiplicative_relation(&bundle.mul_terms, &parsed_sumcheck);
+    let proof_bytes = if let Some(srs) = orbweaver_srs {
+        let round_challenges = collect_sumcheck_round_challenges(&sumcheck_seed, &parsed_sumcheck)?;
+        let weights = eq_table(round_challenges.as_slice());
+        let aggregation_coeffs = derive_orbweaver_aggregation_coeffs(
+            public_values_digest,
+            &bundle.shared_object_commitment,
+            bundle.pi_mul.as_slice(),
+        );
+        let expected_scalar_values = expected_orbweaver_scalar_image_values(&parsed_sumcheck);
+        verify_aggregated_scalar_image_openings_from_mul_terms(
+            srs,
+            bundle.mul_terms.as_slice(),
+            weights.as_slice(),
+            &aggregation_coeffs,
+            &expected_scalar_values,
+            &bundle.pi_mul_terminal_openings,
+        )
+        .map_err(|msg| GermError::MulTerminalOpeningFailed { which: "terminal", msg })?;
+        combined_mul_proof_bytes(
+            &bundle.pi_mul,
+            &bundle.pi_mul_terminal_openings,
+            Some(&digest_srs(srs)),
+        )
+    } else {
+        combined_mul_proof_bytes(&bundle.pi_mul, &bundle.pi_mul_terminal_openings, None)
+    };
     let fingerprint = compute_relation_fingerprint(
         domain,
         public_values_digest,
@@ -2194,7 +3362,7 @@ fn evaluate_multiplicative_relation(
         r_mul,
         &relation_digest,
         &folded_residual,
-        &bundle.pi_mul,
+        proof_bytes.as_slice(),
     );
     Ok(GermRelationCheck { folded_residual, fingerprint })
 }
@@ -2304,11 +3472,8 @@ fn update_sumcheck_round_state(
     evals: &[SP1ExtensionField; 4],
     claim: &SP1ExtensionField,
 ) -> SP1ExtensionField {
-    let mut state = algebraic_absorb(
-        bytes_to_extension(MUL_SUMCHECK_ROUND_STATE_DOMAIN),
-        *prev_state,
-        11,
-    );
+    let mut state =
+        algebraic_absorb(bytes_to_extension(MUL_SUMCHECK_ROUND_STATE_DOMAIN), *prev_state, 11);
     state = algebraic_absorb(state, evals[0], 13);
     state = algebraic_absorb(state, evals[1], 15);
     state = algebraic_absorb(state, evals[2], 17);
@@ -2592,8 +3757,14 @@ fn materialize_sumcheck_round_state_trace(
         ext_zero(),
         11,
     );
-    let after_eval0 =
-        materialize_absorb_trace(witness, Some(after_prev), ext_zero(), Some(evals[0]), ext_zero(), 13);
+    let after_eval0 = materialize_absorb_trace(
+        witness,
+        Some(after_prev),
+        ext_zero(),
+        Some(evals[0]),
+        ext_zero(),
+        13,
+    );
     let after_eval1 = materialize_absorb_trace(
         witness,
         Some(after_eval0),
@@ -2791,6 +3962,131 @@ fn verify_mul_sumcheck(
         return Err(GermError::SumcheckFinalResidualNonZero);
     }
     Ok(())
+}
+
+fn build_orbweaver_terminal_openings_internal(
+    bundle: &Sp1GermBundle,
+    public_values_digest: &[u8; 32],
+    r_mul: &SP1ExtensionField,
+    srs: &OrbweaverOpeningSrs,
+) -> Result<crate::bundle::Sp1MulTerminalOpeningProofs, GermError> {
+    let commitment_root = compute_commitment_root(&bundle.shared_object_commitment);
+    let _ = evaluate_multiplicative_relation(
+        bundle,
+        public_values_digest,
+        &commitment_root,
+        r_mul,
+        b"sp1-germ/mul_bind/v1",
+    )?;
+
+    let mul_proof = decode_mul_sumcheck(&bundle.pi_mul)?;
+    let sumcheck_seed =
+        derive_mul_sumcheck_seed(public_values_digest, &bundle.shared_object_commitment, r_mul);
+    let round_challenges = collect_sumcheck_round_challenges(&sumcheck_seed, &mul_proof)?;
+    let weights = eq_table(round_challenges.as_slice());
+    let aggregation_coeffs = derive_orbweaver_aggregation_coeffs(
+        public_values_digest,
+        &bundle.shared_object_commitment,
+        bundle.pi_mul.as_slice(),
+    );
+    let openings = build_aggregated_scalar_image_openings_from_mul_terms(
+        srs,
+        bundle.mul_terms.as_slice(),
+        weights.as_slice(),
+        &aggregation_coeffs,
+    )
+    .map_err(|msg| GermError::MulTerminalOpeningFailed { which: "terminal", msg })?;
+    let expected_scalar_values = expected_orbweaver_scalar_image_values(&mul_proof);
+    let proofs = decode_orbweaver_aggregated_scalar_openings(&openings)?;
+    for (which, coeffs, proof) in [
+        ("agg0", &aggregation_coeffs[0], &proofs[0]),
+        ("agg1", &aggregation_coeffs[1], &proofs[1]),
+        ("agg2", &aggregation_coeffs[2], &proofs[2]),
+        ("agg3", &aggregation_coeffs[3], &proofs[3]),
+    ] {
+        if proof.opened_value != aggregate_scalar_image_value(&expected_scalar_values, coeffs) {
+            return Err(GermError::MulTerminalOpeningMismatch(which));
+        }
+    }
+    Ok(openings)
+}
+
+fn combined_mul_proof_bytes(
+    pi_mul: &[u8],
+    openings: &Sp1MulTerminalOpeningProofs,
+    srs_digest: Option<&[u8; 32]>,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(
+        pi_mul.len()
+            + openings.a.len()
+            + openings.b.len()
+            + openings.c.len()
+            + openings.d.len()
+            + 56,
+    );
+    out.extend_from_slice(&(pi_mul.len() as u32).to_le_bytes());
+    out.extend_from_slice(pi_mul);
+    for bytes in [&openings.a, &openings.b, &openings.c, &openings.d] {
+        out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(bytes);
+    }
+    if let Some(digest) = srs_digest {
+        out.extend_from_slice(&(digest.len() as u32).to_le_bytes());
+        out.extend_from_slice(digest);
+    } else {
+        out.extend_from_slice(&0u32.to_le_bytes());
+    }
+    out
+}
+
+fn collect_sumcheck_round_challenges(
+    seed: &SP1ExtensionField,
+    proof: &Sp1MulSumcheckProof,
+) -> Result<Vec<SP1ExtensionField>, GermError> {
+    let nvars = proof.nvars as usize;
+    if proof.rounds.len() != nvars {
+        return Err(GermError::SumcheckRoundsMismatch { got: proof.rounds.len(), expected: nvars });
+    }
+    if nvars == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut claimed = ext_zero();
+    let mut sampled = Vec::with_capacity(nvars);
+    let mut round_state = *seed;
+    for (round_idx, round) in proof.rounds.iter().enumerate() {
+        let evals = round.evaluations;
+        if evals[0] + evals[1] != claimed {
+            return Err(GermError::SumcheckIdentityFailed(round_idx));
+        }
+        let r_sc = derive_sumcheck_round_challenge(&round_state);
+        sampled.push(r_sc);
+        claimed = interpolate_0123(&evals, r_sc)?;
+        round_state = update_sumcheck_round_state(&round_state, &evals, &claimed);
+    }
+    Ok(sampled)
+}
+
+fn build_weighted_mul_opening_form(
+    weights: &[SP1ExtensionField],
+    field_exprs: &[[AffineWitnessExpr; 4]],
+    field: MultiplicativeTermField,
+) -> AadpLinearForm<SP1ExtensionField> {
+    let field_idx = match field {
+        MultiplicativeTermField::A => 0,
+        MultiplicativeTermField::B => 1,
+        MultiplicativeTermField::C => 2,
+        MultiplicativeTermField::D => 3,
+    };
+    let mut form = linear_form_constant(ext_zero());
+    for (weight, exprs) in weights.iter().zip(field_exprs.iter()) {
+        let expr = exprs[field_idx];
+        form.constant += *weight * expr.constant;
+        if let Some(var_idx) = expr.var_idx {
+            form.terms.push((var_idx, *weight * expr.scale));
+        }
+    }
+    form
 }
 
 fn encode_lin_proof(proof: &Sp1LinProof) -> Vec<u8> {
@@ -2994,6 +4290,42 @@ fn bytes_to_extension(bytes: &[u8]) -> SP1ExtensionField {
     state
 }
 
+fn derive_orbweaver_jl_rows(seed: &[u8; 32], coords_per_terminal: usize) -> Vec<Vec<Vec<i8>>> {
+    let mut out =
+        vec![vec![vec![0i8; coords_per_terminal]; ORBWEAVER_JL_PROJECTIONS_PER_TERMINAL]; 4];
+    for (terminal_idx, terminal_rows) in out.iter_mut().enumerate() {
+        for (row_idx, row) in terminal_rows.iter_mut().enumerate() {
+            let mut filled = 0usize;
+            let mut block = 0u32;
+            while filled < row.len() {
+                let mut h = Sha256::new();
+                h.update(b"sp1-germ/orbweaver-jl-row/v1");
+                h.update(seed);
+                h.update((terminal_idx as u32).to_le_bytes());
+                h.update((row_idx as u32).to_le_bytes());
+                h.update(block.to_le_bytes());
+                let digest = h.finalize();
+                for byte in digest {
+                    if filled >= row.len() {
+                        break;
+                    }
+                    row[filled] = match byte % 5 {
+                        0 => -1,
+                        1 => 1,
+                        _ => 0,
+                    };
+                    filled += 1;
+                }
+                block = block.wrapping_add(1);
+            }
+            if row.iter().all(|coeff| *coeff == 0) && !row.is_empty() {
+                row[0] = 1;
+            }
+        }
+    }
+    out
+}
+
 fn write_extension(out: &mut Vec<u8>, value: &SP1ExtensionField) {
     for limb in <SP1ExtensionField as AbstractExtensionField<SP1Field>>::as_base_slice(value) {
         out.extend_from_slice(&limb.as_canonical_u32().to_le_bytes());
@@ -3056,6 +4388,45 @@ fn ext_from_u32(x: u32) -> SP1ExtensionField {
     ])
 }
 
+fn ext_from_i64(x: i64) -> SP1ExtensionField {
+    if x >= 0 {
+        ext_from_u32(x as u32)
+    } else {
+        -ext_from_u32((-x) as u32)
+    }
+}
+
+fn ext_from_base_field(x: SP1Field) -> SP1ExtensionField {
+    SP1ExtensionField::from_base_slice(&[x, SP1Field::zero(), SP1Field::zero(), SP1Field::zero()])
+}
+
+fn ext_basis_u() -> SP1ExtensionField {
+    SP1ExtensionField::from_base_slice(&[
+        SP1Field::zero(),
+        SP1Field::one(),
+        SP1Field::zero(),
+        SP1Field::zero(),
+    ])
+}
+
+fn ext_basis_u_squared() -> SP1ExtensionField {
+    SP1ExtensionField::from_base_slice(&[
+        SP1Field::zero(),
+        SP1Field::zero(),
+        SP1Field::one(),
+        SP1Field::zero(),
+    ])
+}
+
+fn ext_basis_u_cubed() -> SP1ExtensionField {
+    SP1ExtensionField::from_base_slice(&[
+        SP1Field::zero(),
+        SP1Field::zero(),
+        SP1Field::zero(),
+        SP1Field::one(),
+    ])
+}
+
 fn ext_from_wrapped_u32(x: u32) -> SP1ExtensionField {
     SP1ExtensionField::from_base_slice(&[
         SP1Field::from_wrapped_u32(x),
@@ -3083,10 +4454,45 @@ fn ext_one() -> SP1ExtensionField {
     ])
 }
 
+fn centered_sp1_i64(value: SP1Field) -> i64 {
+    let canonical = i64::from(value.as_canonical_u32());
+    let modulus = i64::from(SP1Field::ORDER_U32);
+    let half = modulus / 2;
+    if canonical <= half {
+        canonical
+    } else {
+        canonical - modulus
+    }
+}
+
+fn decompose_signed_bits(value: i64, bits: usize) -> Result<Vec<u8>, String> {
+    if bits < 2 {
+        return Err("signed decomposition requires at least 2 bits".to_string());
+    }
+    let min = -(1i64 << (bits - 1));
+    let max = (1i64 << (bits - 1)) - 1;
+    if value < min || value > max {
+        return Err(format!(
+            "signed decomposition overflow: value={} range=[{},{}]",
+            value, min, max
+        ));
+    }
+    let sign = if value < 0 { 1u8 } else { 0u8 };
+    let mut unsigned = if value < 0 { value + (1i64 << (bits - 1)) } else { value } as u64;
+    let mut out = Vec::with_capacity(bits);
+    for _ in 0..(bits - 1) {
+        out.push((unsigned & 1) as u8);
+        unsigned >>= 1;
+    }
+    out.push(sign);
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::bundle::{Sp1LinTerm, Sp1MulTerm};
+    use crate::orbweaver_opening::OrbweaverOpeningSrs;
     use rand::{rngs::StdRng, SeedableRng};
     use slop_algebra::{AbstractExtensionField, AbstractField};
 
@@ -3129,6 +4535,26 @@ mod tests {
                 MultiplicativeResidualDescriptor::Explicit,
             ],
         )
+    }
+
+    fn toy_orbweaver_srs(max_terms: usize) -> OrbweaverOpeningSrs {
+        let witness_width = max_terms * 16;
+        let a0 = vec![crate::koala_ring::KoalaRing64::one()];
+        let v_scalar = SP1Field::from_canonical_u32(7);
+        let v = crate::koala_ring::KoalaRing64::from_scalar(v_scalar);
+        let v_inv_scalar = v_scalar.try_inverse().expect("invertible");
+        let v_inv = crate::koala_ring::KoalaRing64::from_scalar(v_inv_scalar);
+        let mut u0_positive = vec![vec![crate::koala_ring::KoalaRing64::zero()]; witness_width + 1];
+        let mut u0_negative = vec![vec![crate::koala_ring::KoalaRing64::zero()]; witness_width + 1];
+        let mut cur_pos = v;
+        let mut cur_neg = v_inv;
+        for idx in 1..=witness_width {
+            u0_positive[idx] = vec![cur_pos];
+            u0_negative[idx] = vec![cur_neg];
+            cur_pos *= v;
+            cur_neg *= v_inv;
+        }
+        OrbweaverOpeningSrs { a0, v, u0_positive, u0_negative }
     }
 
     #[test]
@@ -3176,12 +4602,9 @@ mod tests {
         let template = compile_germ_aadp_template(&capsule, &residual_plan)
             .expect("aadp template compile should succeed");
         let transcript_bound = TranscriptBoundSp1GermProofObject::new(bundle, commitment_root);
-        let witness = materialize_transcript_bound_germ_aadp_witness(
-            &template,
-            &capsule,
-            &transcript_bound,
-        )
-        .expect("materialize witness should succeed");
+        let witness =
+            materialize_transcript_bound_germ_aadp_witness(&template, &capsule, &transcript_bound)
+                .expect("materialize witness should succeed");
 
         assert!(
             template.stats.linear_round_checks >= 3,
@@ -3189,6 +4612,102 @@ mod tests {
         );
         assert!(template.stats.multiplication_gates >= 2);
         template.check_witness(&witness).expect("template witness must satisfy constraints");
+    }
+
+    #[test]
+    fn compile_transcript_bound_aadp_template_roundtrip() {
+        let a = ext_from_word(7);
+        let b = ext_from_word(11);
+        let c = ext_from_word(13);
+        let mut bundle = Sp1GermBundle::new(
+            b"shared-object-v1".to_vec(),
+            vec![Sp1LinTerm::new(ext_one(), ext_zero())],
+            vec![Sp1MulTerm::new(a, b, ext_one(), a * b), Sp1MulTerm::new(b, c, ext_one(), b * c)],
+            b"lin-proof".to_vec(),
+            b"mul-proof".to_vec(),
+        );
+        let public_values = test_public_values();
+        let residual_plan = test_residual_plan();
+        let capsule = public_values.arm_capsule(&residual_plan);
+        let (commitment_root, _) =
+            bind_bundle_to_capsule(&mut bundle, &capsule).expect("bind should succeed");
+        let transcript_bound = TranscriptBoundSp1GermProofObject::new(bundle, commitment_root);
+
+        let generic_template =
+            compile_germ_aadp_template(&capsule, &residual_plan).expect("generic template compile");
+        let transcript_template = compile_transcript_bound_germ_aadp_template(
+            &capsule,
+            &residual_plan,
+            &transcript_bound,
+        )
+        .expect("transcript-bound template compile");
+        let witness = materialize_transcript_bound_germ_aadp_witness(
+            &transcript_template,
+            &capsule,
+            &transcript_bound,
+        )
+        .expect("materialize witness should succeed");
+
+        assert_eq!(
+            transcript_template.stats.opening_checks,
+            generic_template.stats.opening_checks + 4
+        );
+        assert_eq!(
+            transcript_template.cs.constraints.len(),
+            generic_template.cs.constraints.len() + 4
+        );
+        transcript_template
+            .check_witness(&witness)
+            .expect("witness must satisfy transcript-bound template");
+    }
+
+    #[test]
+    fn transcript_bound_template_rejects_rebound_proof_object() {
+        let a = ext_from_word(7);
+        let b = ext_from_word(11);
+        let c = ext_from_word(13);
+        let public_values = test_public_values();
+        let residual_plan = test_residual_plan();
+        let capsule = public_values.arm_capsule(&residual_plan);
+
+        let mut bundle_a = Sp1GermBundle::new(
+            b"shared-object-v1".to_vec(),
+            vec![Sp1LinTerm::new(ext_one(), ext_zero())],
+            vec![Sp1MulTerm::new(a, b, ext_one(), a * b), Sp1MulTerm::new(b, c, ext_one(), b * c)],
+            b"lin-proof".to_vec(),
+            b"mul-proof".to_vec(),
+        );
+        let (commitment_root_a, _) =
+            bind_bundle_to_capsule(&mut bundle_a, &capsule).expect("bind bundle_a");
+        let transcript_a = TranscriptBoundSp1GermProofObject::new(bundle_a, commitment_root_a);
+        let transcript_template =
+            compile_transcript_bound_germ_aadp_template(&capsule, &residual_plan, &transcript_a)
+                .expect("compile transcript-bound template");
+
+        let a2 = ext_from_word(17);
+        let b2 = ext_from_word(19);
+        let c2 = ext_from_word(23);
+        let mut bundle_b = Sp1GermBundle::new(
+            b"shared-object-v2".to_vec(),
+            vec![Sp1LinTerm::new(ext_one(), ext_zero())],
+            vec![
+                Sp1MulTerm::new(a2, b2, ext_one(), a2 * b2),
+                Sp1MulTerm::new(b2, c2, ext_one(), b2 * c2),
+            ],
+            b"lin-proof".to_vec(),
+            b"mul-proof".to_vec(),
+        );
+        let (commitment_root_b, _) =
+            bind_bundle_to_capsule(&mut bundle_b, &capsule).expect("bind bundle_b");
+        let transcript_b = TranscriptBoundSp1GermProofObject::new(bundle_b, commitment_root_b);
+
+        let err = materialize_transcript_bound_germ_aadp_witness(
+            &transcript_template,
+            &capsule,
+            &transcript_b,
+        )
+        .unwrap_err();
+        assert!(matches!(err, GermError::AadpConstraintUnsatisfied(_)));
     }
 
     #[test]
@@ -3325,6 +4844,115 @@ mod tests {
         tampered_witness[0] += ext_one();
         let err = armed.decap_checked(&GermAadpWitness { witness: tampered_witness }).unwrap_err();
         assert!(matches!(err, GermError::AadpWitnessRejected(_)));
+    }
+
+    #[test]
+    fn orbweaver_terminal_opening_roundtrip() {
+        let a = ext_from_word(7);
+        let b = ext_from_word(11);
+        let c = ext_from_word(13);
+        let mut bundle = Sp1GermBundle::new(
+            b"shared-object-v1".to_vec(),
+            vec![Sp1LinTerm::new(ext_one(), ext_zero())],
+            vec![Sp1MulTerm::new(a, b, ext_one(), a * b), Sp1MulTerm::new(b, c, ext_one(), b * c)],
+            b"lin-proof".to_vec(),
+            b"mul-proof".to_vec(),
+        );
+        let public_values = test_public_values();
+        let srs = crate::orbweaver_opening::generate_local_dev_srs(bundle.mul_terms.len() * 16);
+        let (commitment_root, _) =
+            bind_bundle_with_orbweaver_terminal_openings(&mut bundle, &public_values, &srs)
+                .expect("bind with orbweaver terminal openings");
+        assert!(!bundle.pi_mul_terminal_openings.a.is_empty());
+        assert!(!bundle.pi_mul_terminal_openings.b.is_empty());
+        assert!(!bundle.pi_mul_terminal_openings.c.is_empty());
+        assert!(!bundle.pi_mul_terminal_openings.d.is_empty());
+        let mul_check = verify_mul_with_orbweaver_terminal_openings(
+            &bundle,
+            &public_values,
+            &commitment_root,
+            &srs,
+        )
+        .expect("verify mul with orbweaver terminal openings");
+        assert!(is_zero_ext(&mul_check.folded_residual));
+    }
+
+    #[test]
+    fn orbweaver_terminal_opening_detects_tamper() {
+        let a = ext_from_word(7);
+        let b = ext_from_word(11);
+        let c = ext_from_word(13);
+        let mut bundle = Sp1GermBundle::new(
+            b"shared-object-v1".to_vec(),
+            vec![Sp1LinTerm::new(ext_one(), ext_zero())],
+            vec![Sp1MulTerm::new(a, b, ext_one(), a * b), Sp1MulTerm::new(b, c, ext_one(), b * c)],
+            b"lin-proof".to_vec(),
+            b"mul-proof".to_vec(),
+        );
+        let public_values = test_public_values();
+        let srs = crate::orbweaver_opening::generate_local_dev_srs(bundle.mul_terms.len() * 16);
+        let (commitment_root, _) =
+            bind_bundle_with_orbweaver_terminal_openings(&mut bundle, &public_values, &srs)
+                .expect("bind with orbweaver terminal openings");
+        bundle.pi_mul_terminal_openings.a[0] ^= 0x01;
+        let err = verify_mul_with_orbweaver_terminal_openings(
+            &bundle,
+            &public_values,
+            &commitment_root,
+            &srs,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                GermError::MalformedMulTerminalOpening { .. }
+                    | GermError::MulTerminalOpeningMismatch(_)
+                    | GermError::MulTerminalOpeningFailed { .. }
+            ),
+            "unexpected orbweaver terminal opening error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn orbweaver_template_materialization_roundtrip() {
+        let a = ext_from_word(7);
+        let b = ext_from_word(11);
+        let c = ext_from_word(13);
+        let mut bundle = Sp1GermBundle::new(
+            b"shared-object-v1".to_vec(),
+            vec![Sp1LinTerm::new(ext_one(), ext_zero())],
+            vec![Sp1MulTerm::new(a, b, ext_one(), a * b), Sp1MulTerm::new(b, c, ext_one(), b * c)],
+            b"lin-proof".to_vec(),
+            b"mul-proof".to_vec(),
+        );
+        let public_values = test_public_values();
+        let residual_plan = test_residual_plan();
+        let capsule = public_values.arm_capsule(&residual_plan);
+        let srs = crate::orbweaver_opening::generate_local_dev_srs(bundle.mul_terms.len() * 16);
+        let (commitment_root, _) = bind_bundle_to_capsule_with_orbweaver_terminal_openings(
+            &mut bundle,
+            &capsule,
+            &srs,
+        )
+        .expect("bind with orbweaver terminal openings");
+        let transcript_bound = TranscriptBoundSp1GermProofObject::new(bundle, commitment_root);
+        let template = compile_transcript_bound_germ_aadp_template_with_orbweaver_terminal_openings(
+            &capsule,
+            &residual_plan,
+            &transcript_bound,
+            &srs,
+        )
+        .expect("compile transcript-bound orbweaver template");
+        let witness = materialize_transcript_bound_germ_aadp_witness_with_orbweaver_terminal_openings(
+            &template,
+            &capsule,
+            &transcript_bound,
+            &srs,
+        )
+        .expect("materialize orbweaver witness");
+        template
+            .check_witness(&witness)
+            .expect("orbweaver witness must satisfy template");
     }
 
     #[test]
